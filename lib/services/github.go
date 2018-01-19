@@ -93,6 +93,8 @@ type GithubConnectorSpecV3 struct {
 	RedirectURL string `json:"redirect_url"`
 	// TeamsToLogins maps Github team memberships onto allowed logins/roles
 	TeamsToLogins []TeamMapping `json:"teams_to_logins"`
+	// UsersMap is a mapping of github usernames to ssh logins
+	UsersMap map[string]string `json:"users_map,omitempty"`
 	// Display is the connector display name
 	Display string `json:"display"`
 }
@@ -215,6 +217,11 @@ func (c *GithubConnectorV3) MapClaims(claims GithubClaims) []string {
 		for _, team := range teams {
 			// see if the user belongs to this team
 			if team == mapping.Team {
+				// If there is a mapping for the current github
+				// username to ssh login, we add this login by default
+				if localLogin, ok := c.Spec.UsersMap[claims.Username]; ok {
+					logins = append(logins, localLogin)
+				}
 				logins = append(logins, mapping.Logins...)
 			}
 		}
@@ -303,6 +310,12 @@ var GithubConnectorSpecV3Schema = fmt.Sprintf(`{
     "client_secret": {"type": "string"},
     "redirect_url": {"type": "string"},
     "display": {"type": "string"},
+    "users_map": {
+      "type": "object",
+      "patternProperties": {
+        "^[-a-zA-Z0-9]+$":  { "type": "string" }
+      }
+    },    
     "teams_to_logins": {
       "type": "array",
       "items": %v
