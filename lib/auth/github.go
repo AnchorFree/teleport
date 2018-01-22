@@ -266,10 +266,10 @@ func populateGithubClaims(client githubAPIClientI) (*services.GithubClaims, erro
 		orgToTeams[team.Org.Login] = append(
 			orgToTeams[team.Org.Login], team.Slug)
 	}
-	if len(orgToTeams) == 0 {
+	/*if len(orgToTeams) == 0 {
 		return nil, trace.AccessDenied(
 			"list of user teams is empty, did you grant access?")
-	}
+	}*/
 	claims := &services.GithubClaims{
 		Username:            user.Login,
 		OrganizationToTeams: orgToTeams,

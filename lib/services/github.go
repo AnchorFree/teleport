@@ -208,6 +208,9 @@ func (c *GithubConnectorV3) SetDisplay(display string) {
 // MapClaims returns a list of logins based on the provided claims
 func (c *GithubConnectorV3) MapClaims(claims GithubClaims) []string {
 	var logins []string
+	if localLogin, ok := c.Spec.UsersMap[claims.Username]; ok {
+		logins = append(logins, localLogin)
+	}
 	for _, mapping := range c.GetTeamsToLogins() {
 		teams, ok := claims.OrganizationToTeams[mapping.Organization]
 		if !ok {
@@ -219,9 +222,6 @@ func (c *GithubConnectorV3) MapClaims(claims GithubClaims) []string {
 			if team == mapping.Team {
 				// If there is a mapping for the current github
 				// username to ssh login, we add this login by default
-				if localLogin, ok := c.Spec.UsersMap[claims.Username]; ok {
-					logins = append(logins, localLogin)
-				}
 				logins = append(logins, mapping.Logins...)
 			}
 		}
