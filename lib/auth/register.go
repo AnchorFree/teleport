@@ -17,10 +17,15 @@ limitations under the License.
 package auth
 
 import (
+	"crypto/x509"
+	"fmt"
 	"io/ioutil"
+	"path/filepath"
 	"strings"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
@@ -28,47 +33,87 @@ import (
 
 // LocalRegister is used to generate host keys when a node or proxy is running within the same process
 // as the auth server. This method does not need to use provisioning tokens.
-func LocalRegister(dataDir string, id IdentityID, authServer *AuthServer) error {
-	keys, err := authServer.GenerateServerKeys(id.HostUUID, id.NodeName, teleport.Roles{id.Role})
+func LocalRegister(dataDir string, id IdentityID, authServer *AuthServer, additionalPrincipals []string) error {
+	keys, err := authServer.GenerateServerKeys(GenerateServerKeysRequest{
+		HostID:               id.HostUUID,
+		NodeName:             id.NodeName,
+		Roles:                teleport.Roles{id.Role},
+		AdditionalPrincipals: additionalPrincipals,
+	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
-
-	return writeKeys(dataDir, id, keys.Key, keys.Cert)
+	return writeKeys(dataDir, id, keys.Key, keys.Cert, keys.TLSCert, keys.TLSCACerts[0])
 }
 
 // Register is used to generate host keys when a node or proxy are running on different hosts
 // than the auth server. This method requires provisioning tokens to prove a valid auth server
 // was used to issue the joining request.
-func Register(dataDir, token string, id IdentityID, servers []utils.NetAddr) error {
+func Register(dataDir, token string, id IdentityID, servers []utils.NetAddr, additionalPrincipals []string) error {
 	tok, err := readToken(token)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-
-	// connect to the auth server using a provisioning token. the auth server will
-	// only allow you to connect if it's a valid provisioning token it has generated
-	method, err := NewTokenAuth(id.HostUUID, tok)
+	tlsConfig := utils.TLSConfig()
+	certPath := filepath.Join(dataDir, defaults.CACertFile)
+	certBytes, err := utils.ReadPath(certPath)
 	if err != nil {
-		return trace.Wrap(err)
+		// DELETE IN: 2.6.0
+		// Only support secure cluster joins in the next releases
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+		message := fmt.Sprintf(`Your configuration is insecure! Registering without TLS certificate authority, to fix this warning add ca.cert to %v, you can get ca.cert using 'tctl auth export --type=tls > ca.cert'`, dataDir)
+		log.Warning(message)
+		tlsConfig.InsecureSkipVerify = true
+	} else {
+		cert, err := tlsca.ParseCertificatePEM(certBytes)
+		if err != nil {
+			return trace.Wrap(err, "failed to parse certificate at %v", certPath)
+		}
+		log.Infof("Joining remote cluster %v.", cert.Subject.CommonName)
+		certPool := x509.NewCertPool()
+		certPool.AddCert(cert)
+		tlsConfig.RootCAs = certPool
 	}
-	client, err := NewTunClient(
-		"auth.client.register",
-		servers,
-		id.HostUUID,
-		method)
+	client, err := NewTLSClient(servers, tlsConfig)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	defer client.Close()
 
-	// create the host certificate and keys
-	keys, err := client.RegisterUsingToken(tok, id.HostUUID, id.NodeName, id.Role)
+	// get the host certificate and keys
+	keys, err := client.RegisterUsingToken(RegisterUsingTokenRequest{
+		Token:                tok,
+		HostID:               id.HostUUID,
+		NodeName:             id.NodeName,
+		Role:                 id.Role,
+		AdditionalPrincipals: additionalPrincipals,
+	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	return writeKeys(dataDir, id, keys.Key, keys.Cert)
+	return writeKeys(dataDir, id, keys.Key, keys.Cert, keys.TLSCert, keys.TLSCACerts[0])
+}
+
+// ReRegister renews the certificates  and private keys based on the existing
+// identity ID
+func ReRegister(dataDir string, clt ClientI, id IdentityID, additionalPrincipals []string) error {
+	hostID, err := id.HostID()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	keys, err := clt.GenerateServerKeys(GenerateServerKeysRequest{
+		HostID:               hostID,
+		NodeName:             id.NodeName,
+		Roles:                teleport.Roles{id.Role},
+		AdditionalPrincipals: additionalPrincipals,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	return writeKeys(dataDir, id, keys.Key, keys.Cert, keys.TLSCert, keys.TLSCACerts[0])
 }
 
 func RegisterNewAuth(domainName, token string, servers []utils.NetAddr) error {
@@ -106,7 +151,15 @@ func readToken(token string) (string, error) {
 	return string(out), nil
 }
 
+// PackedKeys is a collection of private key, SSH host certificate
+// and TLS certificate and certificate authority issued the certificate
 type PackedKeys struct {
-	Key  []byte `json:"key"`
+	// Key is a private key
+	Key []byte `json:"key"`
+	// Cert is an SSH host cert
 	Cert []byte `json:"cert"`
+	// TLSCert is an X509 certificate
+	TLSCert []byte `json:"tls_cert"`
+	// TLSCACerts is a list of certificate authorities
+	TLSCACerts [][]byte `json:"tls_ca_certs"`
 }

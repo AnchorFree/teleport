@@ -29,7 +29,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
-	"github.com/gravitational/roundtrip"
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
@@ -37,6 +37,7 @@ import (
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/trace"
 
+	"github.com/gravitational/roundtrip"
 	"github.com/jonboulle/clockwork"
 	oxyforward "github.com/mailgun/oxy/forward"
 	log "github.com/sirupsen/logrus"
@@ -57,6 +58,7 @@ type remoteSite struct {
 	transport   *http.Transport
 	connInfo    services.TunnelConnection
 	ctx         context.Context
+	cancel      context.CancelFunc
 	clock       clockwork.Clock
 
 	// certificateCache caches host certificates for the forwarding server.
@@ -67,13 +69,49 @@ type remoteSite struct {
 	localClient auth.ClientI
 	// remoteClient provides access to the Auth Server API of the remote cluster that
 	// this site belongs to.
-	remoteClient *auth.Client
+	remoteClient auth.ClientI
 	// localAccessPoint provides access to a cached subset of the Auth Server API of
 	// the local cluster.
 	localAccessPoint auth.AccessPoint
 	// remoteAccessPoint provides access to a cached subset of the Auth Server API of
 	// the remote cluster this site belongs to.
 	remoteAccessPoint auth.AccessPoint
+}
+
+func (s *remoteSite) getRemoteClient() (auth.ClientI, bool, error) {
+	// check if all cert authorities are initiated and if everything is OK
+	ca, err := s.srv.localAccessPoint.GetCertAuthority(services.CertAuthID{Type: services.HostCA, DomainName: s.domainName}, false)
+	if err != nil {
+		return nil, false, trace.Wrap(err)
+	}
+	keys := ca.GetTLSKeyPairs()
+	// the fact that cluster has keys to remote CA means that the key exchange has completed
+	if len(keys) != 0 {
+		s.Debugf("Using TLS client to remote cluster.")
+		pool, err := services.CertPool(ca)
+		if err != nil {
+			return nil, false, trace.Wrap(err)
+		}
+		tlsConfig := s.srv.ClientTLS.Clone()
+		tlsConfig.RootCAs = pool
+		clt, err := auth.NewTLSClientWithDialer(s.authServerContextDialer, tlsConfig)
+		if err != nil {
+			return nil, false, trace.Wrap(err)
+		}
+		return clt, false, nil
+	}
+	// create legacy client that will continue to perform certificate
+	// exchange attempts
+	s.Debugf("Created legacy SSH client to remote cluster.")
+	clt, err := auth.NewClient("http://stub:0", s.dialAccessPoint)
+	if err != nil {
+		return nil, false, trace.Wrap(err)
+	}
+	return clt, true, nil
+}
+
+func (s *remoteSite) authServerContextDialer(ctx context.Context, network, address string) (net.Conn, error) {
+	return s.DialAuthServer()
 }
 
 func (s *remoteSite) CachingAccessPoint() (auth.AccessPoint, error) {
@@ -104,6 +142,19 @@ func (s *remoteSite) hasValidConnections() bool {
 		}
 	}
 	return false
+}
+
+// Clos closes remote cluster connections
+func (s *remoteSite) Close() error {
+	s.Lock()
+	defer s.Unlock()
+
+	s.cancel()
+	for i := range s.connections {
+		s.connections[i].Close()
+	}
+	s.connections = []*remoteConn{}
+	return nil
 }
 
 func (s *remoteSite) nextConn() (*remoteConn, error) {
@@ -148,28 +199,15 @@ func (s *remoteSite) getLatestTunnelConnection() (services.TunnelConnection, err
 		s.Warningf("failed to fetch tunnel statuses: %v", err)
 		return nil, trace.Wrap(err)
 	}
-	var lastConn services.TunnelConnection
-	for i := range conns {
-		conn := conns[i]
-		if lastConn == nil || conn.GetLastHeartbeat().After(lastConn.GetLastHeartbeat()) {
-			lastConn = conn
-		}
-	}
-	if lastConn == nil {
-		return nil, trace.NotFound("no connections found")
-	}
-	return lastConn, nil
+	return services.LatestTunnelConnection(conns)
 }
 
 func (s *remoteSite) GetStatus() string {
 	connInfo, err := s.getLatestTunnelConnection()
 	if err != nil {
-		return RemoteSiteStatusOffline
+		return teleport.RemoteClusterStatusOffline
 	}
-	if s.isOnline(connInfo) {
-		return RemoteSiteStatusOnline
-	}
-	return RemoteSiteStatusOffline
+	return services.TunnelConnectionStatus(s.clock, connInfo)
 }
 
 func (s *remoteSite) copyConnInfo() services.TunnelConnection {
@@ -269,9 +307,75 @@ func (s *remoteSite) periodicSendDiscoveryRequests() {
 	}
 }
 
+// DELETE IN: 2.6.0
+// attemptCertExchange tries to exchange TLS certificates with remote
+// clusters that have upgraded to 2.5.0
+func (s *remoteSite) attemptCertExchange() error {
+	// this logic is explicitly using the local non cached
+	// client as it has to have write access to the auth server
+	localCA, err := s.localClient.GetCertAuthority(services.CertAuthID{
+		Type:       services.HostCA,
+		DomainName: s.srv.ClusterName,
+	}, false)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	re, err := s.remoteClient.ExchangeCerts(auth.ExchangeCertsRequest{
+		PublicKey: localCA.GetCheckingKeys()[0],
+		TLSCert:   localCA.GetTLSKeyPairs()[0].Cert,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	remoteCA, err := s.localClient.GetCertAuthority(services.CertAuthID{
+		Type:       services.HostCA,
+		DomainName: s.domainName,
+	}, false)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	_, err = s.localClient.ExchangeCerts(auth.ExchangeCertsRequest{
+		PublicKey: remoteCA.GetCheckingKeys()[0],
+		TLSCert:   re.TLSCert,
+	})
+	return trace.Wrap(err)
+}
+
+// DELETE IN: 2.6.0
+// This logic is only relevant for upgrades from 2.5.0 to 2.6.0
+func (s *remoteSite) periodicAttemptCertExchange() {
+	ticker := time.NewTicker(defaults.NetworkBackoffDuration)
+	defer ticker.Stop()
+	if err := s.attemptCertExchange(); err != nil {
+		s.Warningf("Attempt at cert exchange failed: %v.", err)
+	} else {
+		s.Debugf("Certificate exchange has completed, going to force reconnect.")
+		s.srv.RemoveSite(s.domainName)
+		s.Close()
+		return
+	}
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.Debugf("Context is closing.")
+			return
+		case <-ticker.C:
+			err := s.attemptCertExchange()
+			if err != nil {
+				s.Warningf("Could not perform certificate exchange: %v.", trace.DebugReport(err))
+			} else {
+				s.Debugf("Certificate exchange has completed, going to force reconnect.")
+				s.srv.RemoveSite(s.domainName)
+				s.Close()
+				return
+			}
+		}
+	}
+}
+
 func (s *remoteSite) isOnline(conn services.TunnelConnection) bool {
-	diff := s.clock.Now().Sub(conn.GetLastHeartbeat())
-	return diff < defaults.ReverseTunnelOfflineThreshold
+	return services.TunnelConnectionStatus(s.clock, conn) == teleport.RemoteClusterStatusOnline
 }
 
 // findDisconnectedProxies finds proxies that do not have inbound reverse tunnel
@@ -396,12 +500,7 @@ func (s *remoteSite) dialAccessPoint(network, addr string) (net.Conn, error) {
 }
 
 func (s *remoteSite) DialAuthServer() (conn net.Conn, err error) {
-	conn, err = s.connThroughTunnel(chanTransportDialReq, RemoteAuthServer)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return conn, nil
+	return s.connThroughTunnel(chanTransportDialReq, RemoteAuthServer)
 }
 
 // Dial is used to connect a requesting client (say, tsh) to an SSH server

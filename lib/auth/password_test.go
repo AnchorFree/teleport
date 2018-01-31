@@ -106,10 +106,10 @@ func (s *PasswordSuite) TestTiming(c *C) {
 		elapsedNotExists = elapsedNotExists + elapsed
 	}
 
-	// elapsedDifference must be less than 20 ms
+	// elapsedDifference must be less than 40 ms (with some leeway for delays in runtime)
 	elapsedDifference := elapsedExists/10 - elapsedNotExists/10
-	comment := Commentf("elapsed difference (%v) greater than 30 ms", elapsedDifference)
-	c.Assert(elapsedDifference.Seconds() < 0.030, Equals, true, comment)
+	comment := Commentf("elapsed difference (%v) greater than 40 ms", elapsedDifference)
+	c.Assert(elapsedDifference.Seconds() < 0.040, Equals, true, comment)
 }
 
 func (s *PasswordSuite) TestChangePassword(c *C) {
@@ -191,6 +191,11 @@ func (s *PasswordSuite) prepareForPasswordChange(user string, pass []byte, secon
 		return req, err
 	}
 
+	err = s.a.UpsertCertAuthority(suite.NewTestCA(services.HostCA, "me.localhost"))
+	if err != nil {
+		return req, err
+	}
+
 	ap, err := services.NewAuthPreference(services.AuthPreferenceSpecV2{
 		Type:         teleport.Local,
 		SecondFactor: secondFactorType,
@@ -204,7 +209,10 @@ func (s *PasswordSuite) prepareForPasswordChange(user string, pass []byte, secon
 		return req, err
 	}
 
-	createUserAndRole(s.a, user, []string{user})
+	_, _, err = CreateUserAndRole(s.a, user, []string{user})
+	if err != nil {
+		return req, err
+	}
 	err = s.a.UpsertPassword(user, pass)
 	if err != nil {
 		return req, err

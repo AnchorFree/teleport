@@ -91,9 +91,10 @@ func NewAdminRole() Role {
 		},
 		Spec: RoleSpecV3{
 			Options: RoleOptions{
-				MaxSessionTTL:  NewDuration(defaults.MaxCertDuration),
-				PortForwarding: true,
-				ForwardAgent:   true,
+				CertificateFormat: teleport.CertificateFormatStandard,
+				MaxSessionTTL:     NewDuration(defaults.MaxCertDuration),
+				PortForwarding:    true,
+				ForwardAgent:      true,
 			},
 			Allow: RoleConditions{
 				Namespaces: []string{defaults.Namespace},
@@ -139,9 +140,10 @@ func RoleForUser(u User) Role {
 		},
 		Spec: RoleSpecV3{
 			Options: RoleOptions{
-				MaxSessionTTL:  NewDuration(defaults.MaxCertDuration),
-				PortForwarding: true,
-				ForwardAgent:   true,
+				CertificateFormat: teleport.CertificateFormatStandard,
+				MaxSessionTTL:     NewDuration(defaults.MaxCertDuration),
+				PortForwarding:    true,
+				ForwardAgent:      true,
 			},
 			Allow: RoleConditions{
 				Namespaces: []string{defaults.Namespace},
@@ -217,6 +219,10 @@ const (
 	// PortForwarding defines if the certificate will have "permit-port-forwarding"
 	// in the certificate.
 	PortForwarding = "port_forwarding"
+
+	// CertificateFormat defines the format of the user certificate to allow
+	// compatibility with older versions of OpenSSH.
+	CertificateFormat = "cert_format"
 )
 
 const (
@@ -496,8 +502,9 @@ func (r *RoleV3) CheckAndSetDefaults() error {
 	// make sure we have defaults for all fields
 	if r.Spec.Options == nil {
 		r.Spec.Options = map[string]interface{}{
-			MaxSessionTTL:  NewDuration(defaults.MaxCertDuration),
-			PortForwarding: true,
+			CertificateFormat: teleport.CertificateFormatStandard,
+			MaxSessionTTL:     NewDuration(defaults.MaxCertDuration),
+			PortForwarding:    true,
 		}
 	}
 	if r.Spec.Allow.Namespaces == nil {
@@ -1159,8 +1166,9 @@ func (r *RoleV2) V3() *RoleV3 {
 		Metadata: r.Metadata,
 		Spec: RoleSpecV3{
 			Options: RoleOptions{
-				MaxSessionTTL:  r.GetMaxSessionTTL(),
-				PortForwarding: true,
+				CertificateFormat: teleport.CertificateFormatStandard,
+				MaxSessionTTL:     r.GetMaxSessionTTL(),
+				PortForwarding:    true,
 			},
 			Allow: RoleConditions{
 				Logins:     r.GetLogins(),
@@ -1228,8 +1236,14 @@ type RoleSpecV2 struct {
 	ForwardAgent bool `json:"forward_agent" yaml:"forward_agent"`
 }
 
-// AccessChecker interface implements access checks for given role
+// AccessChecker interface implements access checks for given role or role set
 type AccessChecker interface {
+	// HasRole checks if the checker includes the role
+	HasRole(role string) bool
+
+	// RoleNames returns a list of role names
+	RoleNames() []string
+
 	// CheckAccessToServer checks access to server.
 	CheckAccessToServer(login string, server Server) error
 
@@ -1244,14 +1258,20 @@ type AccessChecker interface {
 	// for this role set, otherwise it returns ttl unchanged
 	AdjustSessionTTL(ttl time.Duration) time.Duration
 
-	// CheckAgentForward checks if the role can request agent forward for this user
+	// CheckAgentForward checks if the role can request agent forward for this
+	// user.
 	CheckAgentForward(login string) error
 
-	// CanForwardAgents returns true if this role set offers capability to forward agents
+	// CanForwardAgents returns true if this role set offers capability to forward
+	// agents.
 	CanForwardAgents() bool
 
 	// CanPortForward returns true if this RoleSet can forward ports.
 	CanPortForward() bool
+
+	// CertificateFormat returns the most permissive certificate format in a
+	// RoleSet.
+	CertificateFormat() string
 }
 
 // FromSpec returns new RoleSet created from spec
@@ -1322,6 +1342,11 @@ func FetchRoles(roleNames []string, access RoleGetter, traits map[string][]strin
 
 // NewRoleSet returns new RoleSet based on the roles
 func NewRoleSet(roles ...Role) RoleSet {
+	// unauthenticated Nop role should not have any privileges
+	// by default, otherwise it is too permissive
+	if len(roles) == 1 && roles[0].GetName() == string(teleport.RoleNop) {
+		return roles
+	}
 	return append(roles, NewImplicitRole())
 }
 
@@ -1365,6 +1390,25 @@ func MatchLabels(selector map[string]string, target map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// RoleNames returns a slice with role names
+func (set RoleSet) RoleNames() []string {
+	out := make([]string, len(set))
+	for i, r := range set {
+		out[i] = r.GetName()
+	}
+	return out
+}
+
+// HasRole checks if the role set has the role
+func (set RoleSet) HasRole(role string) bool {
+	for _, r := range set {
+		if r.GetName() == role {
+			return true
+		}
+	}
+	return false
 }
 
 // AdjustSessionTTL will reduce the requested ttl to lowest max allowed TTL
@@ -1479,6 +1523,48 @@ func (set RoleSet) CanPortForward() bool {
 		}
 	}
 	return false
+}
+
+// CertificateFormat returns the most permissive certificate format in a
+// RoleSet.
+func (set RoleSet) CertificateFormat() string {
+	var formats []string
+
+	for _, role := range set {
+		// get the certificate format for each individual role. if a role does not
+		// have a certificate format (like implicit roles) skip over it
+		certificateFormat, err := role.GetOptions().GetString(CertificateFormat)
+		if err != nil {
+			continue
+		}
+
+		formats = append(formats, certificateFormat)
+	}
+
+	// if no formats were found, return standard
+	if len(formats) == 0 {
+		return teleport.CertificateFormatStandard
+	}
+
+	// sort the slice so the most permissive is the first element
+	sort.Slice(formats, func(i, j int) bool {
+		return certificatePriority(formats[i]) < certificatePriority(formats[j])
+	})
+
+	return formats[0]
+}
+
+// certificatePriority returns the priority of the certificate format. The
+// most permissive has lowest value.
+func certificatePriority(s string) int {
+	switch s {
+	case teleport.CertificateFormatOldSSH:
+		return 0
+	case teleport.CertificateFormatStandard:
+		return 1
+	default:
+		return 2
+	}
 }
 
 // CheckAgentForward checks if the role can request to forward the SSH agent

@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -113,7 +114,7 @@ func (s *IntSuite) SetUpSuite(c *check.C) {
 // newTeleport helper returns a running Teleport instance pre-configured
 // with the current user os.user.Current().
 func (s *IntSuite) newTeleport(c *check.C, logins []string, enableSSH bool) *TeleInstance {
-	t := NewInstance(Site, HostID, Host, s.getPorts(5), s.priv, s.pub)
+	t := NewInstance(InstanceConfig{ClusterName: Site, HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
 	// use passed logins, but use suite's default login if nothing was passed
 	if logins == nil || len(logins) == 0 {
 		logins = []string{s.me.Username}
@@ -134,7 +135,7 @@ func (s *IntSuite) newTeleport(c *check.C, logins []string, enableSSH bool) *Tel
 // Teleport instance with the passed in user, instance secrets, and Teleport
 // configuration.
 func (s *IntSuite) newTeleportWithConfig(c *check.C, logins []string, instanceSecrets []*InstanceSecrets, teleportConfig *service.Config) *TeleInstance {
-	t := NewInstance(Site, HostID, Host, s.getPorts(5), s.priv, s.pub)
+	t := NewInstance(InstanceConfig{ClusterName: Site, HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
 
 	// use passed logins, but use suite's default login if nothing was passed
 	if logins == nil || len(logins) == 0 {
@@ -155,9 +156,9 @@ func (s *IntSuite) newTeleportWithConfig(c *check.C, logins []string, instanceSe
 	return t
 }
 
-// TestAudit creates a live session, records a bunch of data through it (>5MB)
+// TestAuditOn creates a live session, records a bunch of data through it
 // and then reads it back and compares against simulated reality.
-func (s *IntSuite) TestAudit(c *check.C) {
+func (s *IntSuite) TestAuditOn(c *check.C) {
 	var tests = []struct {
 		inRecordLocation string
 		inForwardAgent   bool
@@ -279,16 +280,6 @@ func (s *IntSuite) TestAudit(c *check.C) {
 		// make sure it's us who joined! :)
 		c.Assert(session.Parties[0].User, check.Equals, s.me.Username)
 
-		// lets add something to the session stream:
-		// write 1MB chunk
-		bigChunk := make([]byte, 1024*1024)
-		err = site.PostSessionChunk(defaults.Namespace, session.ID, bytes.NewReader(bigChunk))
-		c.Assert(err, check.Equals, nil)
-
-		// then add small prefix:
-		err = site.PostSessionChunk(defaults.Namespace, session.ID, bytes.NewBufferString("\nsuffix"))
-		c.Assert(err, check.Equals, nil)
-
 		// lets type "echo hi" followed by "enter" and then "exit" + "enter":
 		myTerm.Type("\aecho hi\n\r\aexit\n\r\a")
 
@@ -297,15 +288,17 @@ func (s *IntSuite) TestAudit(c *check.C) {
 
 		// read back the entire session (we have to try several times until we get back
 		// everything because the session is closing)
-		const expectedLen = 1048600
 		var sessionStream []byte
-		for i := 0; len(sessionStream) < expectedLen; i++ {
+		for i := 0; i < 5; i++ {
 			sessionStream, err = site.GetSessionChunk(defaults.Namespace, session.ID, 0, events.MaxChunkBytes)
 			c.Assert(err, check.IsNil)
+			if strings.Contains(string(sessionStream), "exit") {
+				break
+			}
 			time.Sleep(time.Millisecond * 250)
 			if i > 10 {
 				// session stream keeps coming back short
-				c.Fatalf("stream is too short: <%d", expectedLen)
+				c.Fatal("stream is not getting data")
 			}
 		}
 
@@ -316,11 +309,10 @@ func (s *IntSuite) TestAudit(c *check.C) {
 		// hi
 		// edsger ~: exit
 		// logout
-		// <1MB of zeros here>
-		// suffix
 		//
-		c.Assert(strings.Contains(string(sessionStream), "echo hi"), check.Equals, true)
-		c.Assert(strings.Contains(string(sessionStream), "\nsuffix"), check.Equals, true)
+		comment := check.Commentf("%q", string(sessionStream))
+		c.Assert(strings.Contains(string(sessionStream), "echo hi"), check.Equals, true, comment)
+		c.Assert(strings.Contains(string(sessionStream), "exit"), check.Equals, true, comment)
 
 		// now lets look at session events:
 		history, err := site.GetSessionEvents(defaults.Namespace, session.ID, 0)
@@ -364,18 +356,14 @@ func (s *IntSuite) TestAudit(c *check.C) {
 		}
 		c.Assert(start.GetString(events.SessionServerID), check.Equals, expectedServerID)
 
-		// find "\nsuffix" write and find our huge 1MB chunk
-		prefixFound, hugeChunkFound := false, false
+		// make sure data is recorded properly
+		out := &bytes.Buffer{}
 		for _, e := range history {
-			if getChunk(e, 10) == "\nsuffix" {
-				prefixFound = true
-			}
-			if e.GetInt("bytes") == 1048576 {
-				hugeChunkFound = true
-			}
+			out.WriteString(getChunk(e, 1000))
 		}
-		c.Assert(prefixFound, check.Equals, true)
-		c.Assert(hugeChunkFound, check.Equals, true)
+		recorded := replaceNewlines(out.String())
+		c.Assert(recorded, check.Matches, ".*exit.*")
+		c.Assert(recorded, check.Matches, ".*echo hi.*")
 
 		// there should alwys be 'session.end' event
 		end := findByType(events.SessionEndEvent)
@@ -394,6 +382,10 @@ func (s *IntSuite) TestAudit(c *check.C) {
 			c.Assert(e.GetTime("time").IsZero(), check.Equals, false)
 		}
 	}
+}
+
+func replaceNewlines(in string) string {
+	return regexp.MustCompile(`\r?\n`).ReplaceAllString(in, `\n`)
 }
 
 // TestInteroperability checks if Teleport and OpenSSH behave in the same way
@@ -625,8 +617,8 @@ func (s *IntSuite) TestTwoClusters(c *check.C) {
 
 		username := s.me.Username
 
-		a := NewInstance("site-A", HostID, Host, s.getPorts(5), s.priv, s.pub)
-		b := NewInstance("site-B", HostID, Host, s.getPorts(5), s.priv, s.pub)
+		a := NewInstance(InstanceConfig{ClusterName: "site-A", HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
+		b := NewInstance(InstanceConfig{ClusterName: "site-B", HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
 
 		a.AddUser(username, []string{username})
 		b.AddUser(username, []string{username})
@@ -709,7 +701,8 @@ func (s *IntSuite) TestTwoClusters(c *check.C) {
 		// Stop "site-A" and try to connect to it again via "site-A" (expect a connection error)
 		a.Stop(false)
 		err = tc.SSH(context.TODO(), cmd, false)
-		c.Assert(err, check.ErrorMatches, `failed connecting to node localhost. site-A is offline`)
+		// debug mode will add more lines, so this check has to be flexible
+		c.Assert(strings.Replace(err.Error(), "\n", "", -1), check.Matches, `.*site-A is offline.*`)
 
 		// Reset and start "Site-A" again
 		a.Reset()
@@ -783,8 +776,8 @@ func (s *IntSuite) TestTwoClustersProxy(c *check.C) {
 
 	username := s.me.Username
 
-	a := NewInstance("site-A", HostID, Host, s.getPorts(5), s.priv, s.pub)
-	b := NewInstance("site-B", HostID, Host, s.getPorts(5), s.priv, s.pub)
+	a := NewInstance(InstanceConfig{ClusterName: "site-A", HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
+	b := NewInstance(InstanceConfig{ClusterName: "site-B", HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
 
 	a.AddUser(username, []string{username})
 	b.AddUser(username, []string{username})
@@ -817,8 +810,8 @@ func (s *IntSuite) TestTwoClustersProxy(c *check.C) {
 func (s *IntSuite) TestHA(c *check.C) {
 	username := s.me.Username
 
-	a := NewInstance("cluster-a", HostID, Host, s.getPorts(5), s.priv, s.pub)
-	b := NewInstance("cluster-b", HostID, Host, s.getPorts(5), s.priv, s.pub)
+	a := NewInstance(InstanceConfig{ClusterName: "cluster-a", HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
+	b := NewInstance(InstanceConfig{ClusterName: "cluster-b", HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
 
 	a.AddUser(username, []string{username})
 	b.AddUser(username, []string{username})
@@ -886,8 +879,8 @@ func (s *IntSuite) TestMapRoles(c *check.C) {
 
 	clusterMain := "cluster-main"
 	clusterAux := "cluster-aux"
-	main := NewInstance(clusterMain, HostID, Host, s.getPorts(5), s.priv, s.pub)
-	aux := NewInstance(clusterAux, HostID, Host, s.getPorts(5), s.priv, s.pub)
+	main := NewInstance(InstanceConfig{ClusterName: clusterMain, HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
+	aux := NewInstance(InstanceConfig{ClusterName: clusterAux, HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
 
 	// main cluster has a local user and belongs to role "main-devs"
 	mainDevs := "main-devs"
@@ -1074,6 +1067,190 @@ func (s *IntSuite) TestMapRoles(c *check.C) {
 	c.Assert(aux.Stop(true), check.IsNil)
 }
 
+// TestTrustedClusters tests remote clusters scenarios
+// using trusted clusters feature
+func (s *IntSuite) TestTrustedClusters(c *check.C) {
+	s.trustedClusters(c, false)
+}
+
+// TestMultiplexingTrustedClusters tests remote clusters scenarios
+// using trusted clusters feature
+func (s *IntSuite) TestMultiplexingTrustedClusters(c *check.C) {
+	s.trustedClusters(c, true)
+}
+
+func (s *IntSuite) trustedClusters(c *check.C, multiplex bool) {
+	username := s.me.Username
+
+	clusterMain := "cluster-main"
+	clusterAux := "cluster-aux"
+	main := NewInstance(InstanceConfig{ClusterName: clusterMain, HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub, MultiplexProxy: multiplex})
+	aux := NewInstance(InstanceConfig{ClusterName: clusterAux, HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
+
+	// main cluster has a local user and belongs to role "main-devs"
+	mainDevs := "main-devs"
+	role, err := services.NewRole(mainDevs, services.RoleSpecV3{
+		Allow: services.RoleConditions{
+			Logins: []string{username},
+		},
+	})
+	c.Assert(err, check.IsNil)
+	main.AddUserWithRole(username, role)
+
+	// for role mapping test we turn on Web API on the main cluster
+	// as it's used
+	makeConfig := func(enableSSH bool) ([]*InstanceSecrets, *service.Config) {
+		tconf := service.MakeDefaultConfig()
+		tconf.SSH.Enabled = enableSSH
+		tconf.Console = nil
+		tconf.Proxy.DisableWebService = false
+		tconf.Proxy.DisableWebInterface = true
+		return nil, tconf
+	}
+	lib.SetInsecureDevMode(true)
+	defer lib.SetInsecureDevMode(false)
+
+	c.Assert(main.CreateEx(makeConfig(false)), check.IsNil)
+	c.Assert(aux.CreateEx(makeConfig(true)), check.IsNil)
+
+	// auxiliary cluster has a role aux-devs
+	// connect aux cluster to main cluster
+	// using trusted clusters, so remote user will be allowed to assume
+	// role specified by mapping remote role "devs" to local role "local-devs"
+	auxDevs := "aux-devs"
+	role, err = services.NewRole(auxDevs, services.RoleSpecV3{
+		Allow: services.RoleConditions{
+			Logins: []string{username},
+		},
+	})
+	c.Assert(err, check.IsNil)
+	err = aux.Process.GetAuthServer().UpsertRole(role, backend.Forever)
+	c.Assert(err, check.IsNil)
+	trustedClusterToken := "trusted-clsuter-token"
+	err = main.Process.GetAuthServer().UpsertToken(trustedClusterToken, []teleport.Role{teleport.RoleTrustedCluster}, backend.Forever)
+	c.Assert(err, check.IsNil)
+	trustedCluster := main.Secrets.AsTrustedCluster(trustedClusterToken, services.RoleMap{
+		{Remote: mainDevs, Local: []string{auxDevs}},
+	})
+
+	// modify trusted cluster resource name so it would not
+	// match the cluster name to check that it does not matter
+	trustedCluster.SetName(main.Secrets.SiteName + "-cluster")
+
+	c.Assert(main.Start(), check.IsNil)
+	c.Assert(aux.Start(), check.IsNil)
+
+	err = trustedCluster.CheckAndSetDefaults()
+	c.Assert(err, check.IsNil)
+
+	// try and upsert a trusted cluster
+	var upsertSuccess bool
+	for i := 0; i < 10; i++ {
+		log.Debugf("Will create trusted cluster %v, attempt %v", trustedCluster, i)
+		err = aux.Process.GetAuthServer().UpsertTrustedCluster(trustedCluster)
+		if err != nil {
+			if trace.IsConnectionProblem(err) {
+				log.Debugf("retrying on connection problem: %v", err)
+				continue
+			}
+			c.Fatalf("got non connection problem %v", err)
+		}
+		upsertSuccess = true
+		break
+	}
+	// make sure we upsert a trusted cluster
+	c.Assert(upsertSuccess, check.Equals, true)
+
+	nodePorts := s.getPorts(3)
+	sshPort, proxyWebPort, proxySSHPort := nodePorts[0], nodePorts[1], nodePorts[2]
+	c.Assert(aux.StartNodeAndProxy("aux-node", sshPort, proxyWebPort, proxySSHPort), check.IsNil)
+
+	// wait for both sites to see each other via their reverse tunnels (for up to 10 seconds)
+	abortTime := time.Now().Add(time.Second * 10)
+	for len(main.Tunnel.GetSites()) < 2 && len(main.Tunnel.GetSites()) < 2 {
+		time.Sleep(time.Millisecond * 2000)
+		if time.Now().After(abortTime) {
+			c.Fatalf("two clusters do not see each other: tunnels are not working")
+		}
+	}
+
+	cmd := []string{"echo", "hello world"}
+	tc, err := main.NewClient(ClientConfig{Login: username, Cluster: clusterAux, Host: "127.0.0.1", Port: sshPort})
+	c.Assert(err, check.IsNil)
+	output := &bytes.Buffer{}
+	tc.Stdout = output
+	c.Assert(err, check.IsNil)
+	// try to execute an SSH command using the same old client  to Site-B
+	// "site-A" and "site-B" reverse tunnels are supposed to reconnect,
+	// and 'tc' (client) is also supposed to reconnect
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Millisecond * 50)
+		err = tc.SSH(context.TODO(), cmd, false)
+		if err == nil {
+			break
+		}
+	}
+	c.Assert(err, check.IsNil)
+	c.Assert(output.String(), check.Equals, "hello world\n")
+
+	// check that remote cluster has been provisioned
+	remoteClusters, err := main.Process.GetAuthServer().GetRemoteClusters()
+	c.Assert(err, check.IsNil)
+	c.Assert(remoteClusters, check.HasLen, 1)
+	c.Assert(remoteClusters[0].GetName(), check.Equals, clusterAux)
+
+	// after removing the remote cluster, the connection will start failing
+	err = main.Process.GetAuthServer().DeleteRemoteCluster(clusterAux)
+	c.Assert(err, check.IsNil)
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Millisecond * 50)
+		err = tc.SSH(context.TODO(), cmd, false)
+		if err != nil {
+			break
+		}
+	}
+	c.Assert(err, check.NotNil, check.Commentf("expected tunnel to close and SSH client to start failing"))
+
+	// remove trusted cluster from aux cluster side, and recrete right after
+	// this should re-establish connection
+	err = aux.Process.GetAuthServer().DeleteTrustedCluster(trustedCluster.GetName())
+	c.Assert(err, check.IsNil)
+	err = aux.Process.GetAuthServer().UpsertTrustedCluster(trustedCluster)
+	c.Assert(err, check.IsNil)
+
+	// check that remote cluster has been re-provisioned
+	remoteClusters, err = main.Process.GetAuthServer().GetRemoteClusters()
+	c.Assert(err, check.IsNil)
+	c.Assert(remoteClusters, check.HasLen, 1)
+	c.Assert(remoteClusters[0].GetName(), check.Equals, clusterAux)
+
+	// wait for both sites to see each other via their reverse tunnels (for up to 10 seconds)
+	abortTime = time.Now().Add(time.Second * 10)
+	for len(main.Tunnel.GetSites()) < 2 {
+		time.Sleep(time.Millisecond * 2000)
+		if time.Now().After(abortTime) {
+			c.Fatalf("two clusters do not see each other: tunnels are not working")
+		}
+	}
+
+	// connection and client should recover and work again
+	output = &bytes.Buffer{}
+	tc.Stdout = output
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Millisecond * 50)
+		err = tc.SSH(context.TODO(), cmd, false)
+		if err == nil {
+			break
+		}
+	}
+	c.Assert(err, check.IsNil)
+	c.Assert(output.String(), check.Equals, "hello world\n")
+
+	// stop clusters and remaining nodes
+	c.Assert(main.Stop(true), check.IsNil)
+	c.Assert(aux.Stop(true), check.IsNil)
+}
+
 // TestDiscovery tests case for multiple proxies and a reverse tunnel
 // agent that eventually connnects to the the right proxy
 func (s *IntSuite) TestDiscovery(c *check.C) {
@@ -1087,8 +1264,8 @@ func (s *IntSuite) TestDiscovery(c *check.C) {
 	go lb.Serve()
 	defer lb.Close()
 
-	remote := NewInstance("cluster-remote", HostID, Host, s.getPorts(5), s.priv, s.pub)
-	main := NewInstance("cluster-main", HostID, Host, s.getPorts(5), s.priv, s.pub)
+	remote := NewInstance(InstanceConfig{ClusterName: "cluster-remote", HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
+	main := NewInstance(InstanceConfig{ClusterName: "cluster-main", HostID: HostID, NodeName: Host, Ports: s.getPorts(5), Priv: s.priv, Pub: s.pub})
 
 	remote.AddUser(username, []string{username})
 	main.AddUser(username, []string{username})

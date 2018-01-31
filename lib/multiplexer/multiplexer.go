@@ -27,6 +27,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -50,6 +51,12 @@ type Config struct {
 	// Clock is a clock to override in tests, set to real time clock
 	// by default
 	Clock clockwork.Clock
+	// EnableProxyProtocol enables proxy protocol
+	EnableProxyProtocol bool
+	// DisableSSH disables SSH socket
+	DisableSSH bool
+	// DisableTLS disables TLS socket
+	DisableTLS bool
 }
 
 // CheckAndSetDefaults verifies configuration and sets defaults
@@ -74,6 +81,7 @@ func New(cfg Config) (*Mux, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	ctx, cancel := context.WithCancel(cfg.Context)
 	waitContext, waitCancel := context.WithCancel(context.TODO())
 	return &Mux{
@@ -157,6 +165,10 @@ func (m *Mux) Serve() error {
 	for {
 		conn, err := m.Listener.Accept()
 		if err == nil {
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				tcpConn.SetKeepAlive(true)
+				tcpConn.SetKeepAlivePeriod(3 * time.Minute)
+			}
 			go m.detectAndForward(conn)
 			continue
 		}
@@ -179,22 +191,29 @@ func (m *Mux) detectAndForward(conn net.Conn) {
 		conn.Close()
 		return
 	}
-	connWrapper, err := detect(conn)
+	connWrapper, err := detect(conn, m.EnableProxyProtocol)
 	if err != nil {
-		m.Warning(err.Error())
+		if trace.Unwrap(err) != io.EOF {
+			m.Warning(trace.DebugReport(err))
+		}
 		conn.Close()
 		return
 	}
 
 	err = conn.SetReadDeadline(time.Time{})
 	if err != nil {
-		m.Warning(err.Error())
+		m.Warning(trace.DebugReport(err))
 		conn.Close()
 		return
 	}
 
 	switch connWrapper.protocol {
 	case ProtoTLS:
+		if m.DisableTLS {
+			m.Debug("Closing TLS connection: TLS listener is disabled.")
+			conn.Close()
+			return
+		}
 		select {
 		case m.tlsListener.connC <- connWrapper:
 		case <-m.context.Done():
@@ -202,6 +221,11 @@ func (m *Mux) detectAndForward(conn net.Conn) {
 			return
 		}
 	case ProtoSSH:
+		if m.DisableSSH {
+			m.Debug("Closing SSH connection: SSH listener is disabled.")
+			conn.Close()
+			return
+		}
 		select {
 		case m.sshListener.connC <- connWrapper:
 		case <-m.context.Done():
@@ -215,7 +239,7 @@ func (m *Mux) detectAndForward(conn net.Conn) {
 	}
 }
 
-func detect(conn net.Conn) (*Conn, error) {
+func detect(conn net.Conn, enableProxyProtocol bool) (*Conn, error) {
 	reader := bufio.NewReader(conn)
 
 	// the first attempt is to parse optional proxy
@@ -237,6 +261,9 @@ func detect(conn net.Conn) (*Conn, error) {
 
 		switch proto {
 		case ProtoProxy:
+			if !enableProxyProtocol {
+				return nil, trace.BadParameter("proxy protocol support is disabled")
+			}
 			if proxyLine != nil {
 				return nil, trace.BadParameter("duplicate proxy line")
 			}
@@ -285,6 +312,6 @@ func detectProto(in []byte) (int, error) {
 	case bytes.HasPrefix(in, tlsPrefix):
 		return ProtoTLS, nil
 	default:
-		return ProtoUnknown, trace.BadParameter("failed to detect protocol")
+		return ProtoUnknown, trace.BadParameter("failed to detect protocol by prefix: %v", in)
 	}
 }

@@ -10,7 +10,7 @@
 # Naming convention:
 #	for stable releases we use "1.0.0" format
 #   for pre-releases, we use   "1.0.0-beta.2" format
-VERSION=2.4.2
+VERSION=2.4.3
 
 # These are standard autotools variables, don't change them please
 BUILDDIR ?= build
@@ -63,6 +63,7 @@ full: all $(BUILDDIR)/webassets.zip
 	cat $(BUILDDIR)/webassets.zip >> $(BUILDDIR)/teleport
 	rm -fr $(BUILDDIR)/webassets.zip
 	zip -q -A $(BUILDDIR)/teleport
+	if [ -f e/Makefile ]; then $(MAKE) -C e full; fi
 
 
 .PHONY: clean

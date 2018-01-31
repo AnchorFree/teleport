@@ -36,7 +36,6 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/julienschmidt/httprouter"
-	log "github.com/sirupsen/logrus"
 	"github.com/tstranex/u2f"
 )
 
@@ -69,6 +68,11 @@ func NewAPIServer(config *APIConfig) http.Handler {
 	srv.GET("/:version/authorities/:type/:domain", srv.withAuth(srv.getCertAuthority))
 	srv.GET("/:version/authorities/:type", srv.withAuth(srv.getCertAuthorities))
 
+	// DELETE IN: 2.6.0
+	// Certificate exchange for cluster upgrades used to upgrade from 2.4.0
+	// to 2.5.0 clusters.
+	srv.POST("/:version/exchangecerts", srv.withAuth(srv.exchangeCerts))
+
 	// Generating certificates for user and host authorities
 	srv.POST("/:version/ca/host/certs", srv.withAuth(srv.generateHostCert))
 	srv.POST("/:version/ca/user/certs", srv.withAuth(srv.generateUserCert))
@@ -90,6 +94,8 @@ func NewAPIServer(config *APIConfig) http.Handler {
 	srv.POST("/:version/users/:user/web/signin", srv.withAuth(srv.signIn))
 	srv.GET("/:version/users/:user/web/signin/preauth", srv.withAuth(srv.preAuthenticatedSignIn))
 	srv.POST("/:version/users/:user/web/sessions", srv.withAuth(srv.createWebSession))
+	srv.POST("/:version/users/:user/web/authenticate", srv.withAuth(srv.authenticateWebUser))
+	srv.POST("/:version/users/:user/ssh/authenticate", srv.withAuth(srv.authenticateSSHUser))
 	srv.GET("/:version/users/:user/web/sessions/:sid", srv.withAuth(srv.getWebSession))
 	srv.DELETE("/:version/users/:user/web/sessions/:sid", srv.withAuth(srv.deleteWebSession))
 	srv.GET("/:version/signuptokens/:token", srv.withAuth(srv.getSignupTokenData))
@@ -109,6 +115,15 @@ func NewAPIServer(config *APIConfig) http.Handler {
 	srv.DELETE("/:version/tunnelconnections/:cluster/:conn", srv.withAuth(srv.deleteTunnelConnection))
 	srv.DELETE("/:version/tunnelconnections/:cluster", srv.withAuth(srv.deleteTunnelConnections))
 	srv.DELETE("/:version/tunnelconnections", srv.withAuth(srv.deleteAllTunnelConnections))
+
+	// Server Credentials
+	srv.POST("/:version/server/credentials", srv.withAuth(srv.generateServerKeys))
+
+	srv.POST("/:version/remoteclusters", srv.withAuth(srv.createRemoteCluster))
+	srv.GET("/:version/remoteclusters/:cluster", srv.withAuth(srv.getRemoteCluster))
+	srv.GET("/:version/remoteclusters", srv.withAuth(srv.getRemoteClusters))
+	srv.DELETE("/:version/remoteclusters/:cluster", srv.withAuth(srv.deleteRemoteCluster))
+	srv.DELETE("/:version/remoteclusters", srv.withAuth(srv.deleteAllRemoteClusters))
 
 	// Reverse tunnels
 	srv.POST("/:version/reversetunnels", srv.withAuth(srv.upsertReverseTunnel))
@@ -226,8 +241,13 @@ func (s *APIServer) withAuth(handler HandlerWithAuthFunc) httprouter.Handle {
 			// between connection failed and access denied
 			if trace.IsConnectionProblem(err) {
 				return nil, trace.ConnectionProblem(err, "[07] failed to connect to the database")
+			} else if trace.IsAccessDenied(err) {
+				// don't print stack trace, just log the warning
+				log.Warn(err)
+			} else {
+				log.Warn(trace.DebugReport(err))
 			}
-			log.Warn(accessDeniedMsg + err.Error())
+
 			return nil, trace.AccessDenied(accessDeniedMsg + "[00]")
 		}
 		auth := &AuthWithRoles{
@@ -370,7 +390,9 @@ func (s *APIServer) upsertReverseTunnel(auth ClientI, w http.ResponseWriter, r *
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	tun.SetTTL(s, req.TTL)
+	if req.TTL != 0 {
+		tun.SetTTL(s, req.TTL)
+	}
 	if err := auth.UpsertReverseTunnel(tun); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -601,6 +623,36 @@ func (s *APIServer) createWebSession(auth ClientI, w http.ResponseWriter, r *htt
 	return rawMessage(services.GetWebSessionMarshaler().MarshalWebSession(sess, services.WithVersion(version)))
 }
 
+func (s *APIServer) authenticateWebUser(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	var req AuthenticateUserRequest
+	if err := httplib.ReadJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	req.Username = p.ByName("user")
+	sess, err := auth.AuthenticateWebUser(req)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return rawMessage(services.GetWebSessionMarshaler().MarshalWebSession(sess, services.WithVersion(version)))
+}
+
+func (s *APIServer) authenticateSSHUser(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	var req AuthenticateSSHRequest
+	if err := httplib.ReadJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	req.Username = p.ByName("user")
+	return auth.AuthenticateSSHUser(req)
+}
+
+func (s *APIServer) exchangeCerts(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	var req ExchangeCertsRequest
+	if err := httplib.ReadJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return auth.ExchangeCerts(req)
+}
+
 func (s *APIServer) changePassword(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
 	var req services.ChangePasswordReq
 	if err := httplib.ReadJSON(r, &req); err != nil {
@@ -772,11 +824,11 @@ func (s *APIServer) generateUserCert(auth ClientI, w http.ResponseWriter, r *htt
 	if err := httplib.ReadJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	compatibility, err := utils.CheckCompatibilityFlag(req.Compatibility)
+	certificateFormat, err := utils.CheckCertificateFormatFlag(req.Compatibility)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	cert, err := auth.GenerateUserCert(req.Key, req.User, req.TTL, compatibility)
+	cert, err := auth.GenerateUserCert(req.Key, req.User, req.TTL, certificateFormat)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -797,11 +849,11 @@ func (s *APIServer) generateUserCertBundle(auth ClientI, w http.ResponseWriter, 
 	}
 
 	// create the user certificate
-	compatibility, err := utils.CheckCompatibilityFlag(req.Compatibility)
+	certificateFormat, err := utils.CheckCertificateFormatFlag(req.Compatibility)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	cert, err := auth.GenerateUserCert(req.Key, req.User, req.TTL, compatibility)
+	cert, err := auth.GenerateUserCert(req.Key, req.User, req.TTL, certificateFormat)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -840,24 +892,15 @@ func (s *APIServer) generateToken(auth ClientI, w http.ResponseWriter, r *http.R
 	return string(token), nil
 }
 
-type registerUsingTokenReq struct {
-	HostID   string        `json:"hostID"`
-	NodeName string        `json:"node_name"`
-	Role     teleport.Role `json:"role"`
-	Token    string        `json:"token"`
-}
-
 func (s *APIServer) registerUsingToken(auth ClientI, w http.ResponseWriter, r *http.Request, _ httprouter.Params, version string) (interface{}, error) {
-	var req *registerUsingTokenReq
+	var req RegisterUsingTokenRequest
 	if err := httplib.ReadJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	keys, err := auth.RegisterUsingToken(req.Token, req.HostID, req.NodeName, req.Role)
+	keys, err := auth.RegisterUsingToken(req)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
 	return keys, nil
 }
 
@@ -875,6 +918,20 @@ func (s *APIServer) registerNewAuthServer(auth ClientI, w http.ResponseWriter, r
 		return nil, trace.Wrap(err)
 	}
 	return message("ok"), nil
+}
+
+func (s *APIServer) generateServerKeys(auth ClientI, w http.ResponseWriter, r *http.Request, _ httprouter.Params, version string) (interface{}, error) {
+	var req GenerateServerKeysRequest
+	if err := httplib.ReadJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	keys, err := auth.GenerateServerKeys(req)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return keys, nil
 }
 
 type upsertCertAuthorityRawReq struct {
@@ -1119,7 +1176,7 @@ func (s *APIServer) createUserWithToken(auth ClientI, w http.ResponseWriter, r *
 		webSession, err = auth.CreateUserWithOTP(req.Token, req.Password, req.OTPToken)
 	}
 	if err != nil {
-		log.Error(trace.DebugReport(err))
+		log.Warningf("failed to create user: %v", err.Error())
 		return nil, trace.Wrap(err)
 	}
 
@@ -1241,6 +1298,8 @@ type oidcAuthRawResponse struct {
 	Session json.RawMessage `json:"session,omitempty"`
 	// Cert will be generated by certificate authority
 	Cert []byte `json:"cert,omitempty"`
+	// TLSCert is PEM encoded TLS certificate
+	TLSCert []byte `json:"tls_cert,omitempty"`
 	// Req is original oidc auth request
 	Req services.OIDCAuthRequest `json:"req"`
 	// HostSigners is a list of signing host public keys
@@ -1261,6 +1320,7 @@ func (s *APIServer) validateOIDCAuthCallback(auth ClientI, w http.ResponseWriter
 		Username: response.Username,
 		Identity: response.Identity,
 		Cert:     response.Cert,
+		TLSCert:  response.TLSCert,
 		Req:      response.Req,
 	}
 	if response.Session != nil {
@@ -2121,6 +2181,71 @@ func (s *APIServer) deleteTunnelConnections(auth ClientI, w http.ResponseWriter,
 // deleteAllTunnelConnections deletes all tunnel connections
 func (s *APIServer) deleteAllTunnelConnections(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
 	err := auth.DeleteAllTunnelConnections()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return message("ok"), nil
+}
+
+type createRemoteClusterRawReq struct {
+	// RemoteCluster is marshalled remote cluster resource
+	RemoteCluster json.RawMessage `json:"remote_cluster"`
+}
+
+// createRemoteCluster creates remote cluster
+func (s *APIServer) createRemoteCluster(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	var req createRemoteClusterRawReq
+	if err := httplib.ReadJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	conn, err := services.UnmarshalRemoteCluster(req.RemoteCluster)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if err := auth.CreateRemoteCluster(conn); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return message("ok"), nil
+}
+
+// getRemoteClusters returns a list of remote clusters
+func (s *APIServer) getRemoteClusters(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	clusters, err := auth.GetRemoteClusters()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	items := make([]json.RawMessage, len(clusters))
+	for i, cluster := range clusters {
+		data, err := services.MarshalRemoteCluster(cluster, services.WithVersion(version))
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		items[i] = data
+	}
+	return items, nil
+}
+
+// getRemoteCluster returns a remote cluster by name
+func (s *APIServer) getRemoteCluster(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	cluster, err := auth.GetRemoteCluster(p.ByName("cluster"))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return rawMessage(services.MarshalRemoteCluster(cluster, services.WithVersion(version)))
+}
+
+// deleteRemoteCluster deletes remote cluster by name
+func (s *APIServer) deleteRemoteCluster(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	err := auth.DeleteRemoteCluster(p.ByName("cluster"))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return message("ok"), nil
+}
+
+// deleteAllRemoteClusters deletes all remote clusters
+func (s *APIServer) deleteAllRemoteClusters(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	err := auth.DeleteAllRemoteClusters()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

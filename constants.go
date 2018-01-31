@@ -51,6 +51,12 @@ const (
 )
 
 const (
+	// ComponentAuthority is a TLS and an SSH certificate authority
+	ComponentAuthority = "authority"
+
+	// ComponentProcess is a main control process
+	ComponentProcess = "process"
+
 	// ComponentReverseTunnelServer is reverse tunnel server
 	// that together with agent establish a bi-directional SSH revers tunnel
 	// to bypass firewall restrictions
@@ -172,6 +178,16 @@ const (
 	// DirMaskSharedGroup is the mask for a directory accessible
 	// by the owner and group
 	DirMaskSharedGroup = 0770
+
+	// FileMaskOwnerOnly is the file mask that allows read write access
+	// to owers only
+	FileMaskOwnerOnly = 0600
+
+	// On means mode is on
+	On = "on"
+
+	// Off means mode is off
+	Off = "off"
 )
 
 const (
@@ -211,13 +227,17 @@ const (
 const MaxEnvironmentFileLines = 1000
 
 const (
-	// CompatibilityOldSSH is used to make Teleport interoperate with older
+	// CertificateFormatOldSSH is used to make Teleport interoperate with older
 	// versions of OpenSSH.
-	CompatibilityOldSSH = "oldssh"
+	CertificateFormatOldSSH = "oldssh"
 
-	// CompatibilityNone is used for normal Teleport operation without any
+	// CertificateFormatStandard is used for normal Teleport operation without any
 	// compatibility modes.
-	CompatibilityNone = ""
+	CertificateFormatStandard = "standard"
+
+	// CertificateFormatUnspecified is used to check if the format was specified
+	// or not.
+	CertificateFormatUnspecified = ""
 )
 
 const (
@@ -247,3 +267,15 @@ const AdminRoleName = "admin"
 // DefaultImplicitRole is implicit role that gets added to all service.RoleSet
 // objects.
 const DefaultImplicitRole = "default-implicit-role"
+
+// APIDomain is a default domain name for Auth server API
+const APIDomain = "teleport.cluster.local"
+
+const (
+	// RemoteClusterStatusOffline indicates that cluster is considered as
+	// offline, since it has missed a series of heartbeats
+	RemoteClusterStatusOffline = "offline"
+	// RemoteClusterStatusOnline indicates that cluster is sending heartbeats
+	// at expected interval
+	RemoteClusterStatusOnline = "online"
+)

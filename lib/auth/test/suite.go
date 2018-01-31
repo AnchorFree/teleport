@@ -21,8 +21,8 @@ import (
 	"time"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/sshca"
 
 	"golang.org/x/crypto/ssh"
 	. "gopkg.in/check.v1"
@@ -31,7 +31,7 @@ import (
 func TestAuth(t *testing.T) { TestingT(t) }
 
 type AuthSuite struct {
-	A auth.Authority
+	A sshca.Authority
 }
 
 func (s *AuthSuite) GenerateKeypairEmptyPass(c *C) {
@@ -88,6 +88,7 @@ func (s *AuthSuite) GenerateUserCert(c *C) {
 		TTL:                 time.Hour,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
+		CertificateFormat:     teleport.CertificateFormatStandard,
 	})
 	c.Assert(err, IsNil)
 
@@ -102,6 +103,7 @@ func (s *AuthSuite) GenerateUserCert(c *C) {
 		TTL:                 -20,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
+		CertificateFormat:     teleport.CertificateFormatStandard,
 	})
 	c.Assert(err, NotNil)
 
@@ -113,6 +115,7 @@ func (s *AuthSuite) GenerateUserCert(c *C) {
 		TTL:                 0,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
+		CertificateFormat:     teleport.CertificateFormatStandard,
 	})
 	c.Assert(err, NotNil)
 
@@ -124,6 +127,7 @@ func (s *AuthSuite) GenerateUserCert(c *C) {
 		TTL:                 time.Hour,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
+		CertificateFormat:     teleport.CertificateFormatStandard,
 	})
 	c.Assert(err, IsNil)
 
@@ -136,6 +140,7 @@ func (s *AuthSuite) GenerateUserCert(c *C) {
 		TTL:                 time.Hour,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
+		CertificateFormat:     teleport.CertificateFormatStandard,
 		Roles:                 inRoles,
 	})
 	c.Assert(err, IsNil)

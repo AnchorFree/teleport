@@ -64,7 +64,7 @@ type AgentConfig struct {
 	// Signers contains authentication signers
 	Signers []ssh.Signer
 	// Client is a client to the local auth servers
-	Client *auth.TunClient
+	Client auth.ClientI
 	// AccessPoint is a caching access point to the local auth servers
 	AccessPoint auth.AccessPoint
 	// Context is a parent context
@@ -304,11 +304,16 @@ func (a *Agent) connect() (conn *ssh.Client, err error) {
 	return conn, err
 }
 
+// DELETE IN: 2.6.0
+// proxyAccessPoint channel request is deprecated and not used by 2.5.0
+// clusters any more. New clusters communicate with auth servers directly
+// via dial-direct-tcipip
 func (a *Agent) proxyAccessPoint(ch ssh.Channel, req <-chan *ssh.Request) {
 	a.Debugf("proxyAccessPoint")
 	defer ch.Close()
 
-	conn, err := a.Client.GetDialer()()
+	// shall terminate TLS
+	conn, err := a.Client.GetDialer()(context.TODO())
 	if err != nil {
 		a.Warningf("error dialing: %v", err)
 		return
@@ -372,11 +377,6 @@ func (a *Agent) proxyTransport(ch ssh.Channel, reqC <-chan *ssh.Request) {
 	server := string(req.Payload)
 	var servers []string
 
-	// Deprecated: Remove in Teleport 2.5.
-	//   Starting with Teleport 2.4 the client now discovers the list of Auth
-	//   Servers and sends them via the transport request. So this block can be
-	//   be replaced just net.Dial.
-	//
 	// if the request is for the special string @remote-auth-server, then get the
 	// list of auth servers and return that. otherwise try and connect to the
 	// passed in server.
@@ -458,7 +458,7 @@ func (a *Agent) run() {
 	ticker, err := utils.NewSwitchTicker(defaults.FastAttempts,
 		defaults.NetworkRetryDuration, defaults.NetworkBackoffDuration)
 	if err != nil {
-		log.Errorf("failed to run: %v", err)
+		a.Errorf("Failed to run: %v.", err)
 		return
 	}
 	defer ticker.Stop()
@@ -475,7 +475,7 @@ func (a *Agent) run() {
 			select {
 			// abort if asked to stop:
 			case <-a.ctx.Done():
-				a.Debugf("agent has closed, exiting")
+				a.Debug("Agent has closed, exiting.")
 				return
 				// wait backoff on network retries
 			case <-ticker.Channel():
@@ -487,7 +487,7 @@ func (a *Agent) run() {
 		firstAttempt = false
 		if err != nil || conn == nil {
 			ticker.IncrementFailureCount()
-			a.Warningf("failed to create remote tunnel: %v, conn: %v", err, conn)
+			a.Warningf("Failed to create remote tunnel: %v, conn: %v.", err, conn)
 			continue
 		}
 
@@ -498,7 +498,7 @@ func (a *Agent) run() {
 			// we did not connect to a proxy in the discover list (which means we
 			// connected to a proxy we already have a connection to), try again
 			if !a.connectedToRightProxy() {
-				a.Debugf("missed, connected to %v instead of %v", a.getPrincipalsList(), Proxies(a.DiscoverProxies))
+				a.Debugf("Missed, connected to %v instead of %v.", a.getPrincipalsList(), Proxies(a.DiscoverProxies))
 				conn.Close()
 				continue
 			}
@@ -510,7 +510,7 @@ func (a *Agent) run() {
 			select {
 			case a.EventsC <- ConnectedEvent:
 			case <-a.ctx.Done():
-				a.Debugf("context is closing")
+				a.Debug("Context is closing.")
 				return
 			default:
 			}
@@ -650,15 +650,6 @@ const (
 	chanTransport        = "teleport-transport"
 	chanTransportDialReq = "teleport-transport-dial"
 	chanDiscovery        = "teleport-discovery"
-)
-
-const (
-	// RemoteSiteStatusOffline indicates that site is considered as
-	// offline, since it has missed a series of heartbeats
-	RemoteSiteStatusOffline = "offline"
-	// RemoteSiteStatusOnline indicates that site is sending heartbeats
-	// at expected interval
-	RemoteSiteStatusOnline = "online"
 )
 
 // RemoteAuthServer is a special non-resolvable address that indicates we want
