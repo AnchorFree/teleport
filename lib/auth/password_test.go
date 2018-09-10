@@ -57,17 +57,20 @@ func (s *PasswordSuite) SetUpTest(c *C) {
 	s.bk, err = boltbk.New(backend.Params{"path": c.MkDir()})
 	c.Assert(err, IsNil)
 
-	authConfig := &InitConfig{
-		Backend:   s.bk,
-		Authority: authority.New(),
-	}
-	s.a = NewAuthServer(authConfig)
-
 	// set cluster name
 	clusterName, err := services.NewClusterName(services.ClusterNameSpecV2{
 		ClusterName: "me.localhost",
 	})
 	c.Assert(err, IsNil)
+	authConfig := &InitConfig{
+		ClusterName:            clusterName,
+		Backend:                s.bk,
+		Authority:              authority.New(),
+		SkipPeriodicOperations: true,
+	}
+	s.a, err = NewAuthServer(authConfig)
+	c.Assert(err, IsNil)
+
 	err = s.a.SetClusterName(clusterName)
 	c.Assert(err, IsNil)
 
@@ -117,7 +120,7 @@ func (s *PasswordSuite) TestChangePassword(c *C) {
 	c.Assert(err, IsNil)
 
 	fakeClock := clockwork.NewFakeClock()
-	s.a.clock = fakeClock
+	s.a.SetClock(fakeClock)
 	req.NewPassword = []byte("abce456")
 
 	err = s.a.ChangePassword(req)
@@ -142,9 +145,9 @@ func (s *PasswordSuite) TestChangePasswordWithOTP(c *C) {
 	c.Assert(err, IsNil)
 
 	fakeClock := clockwork.NewFakeClock()
-	s.a.clock = fakeClock
+	s.a.SetClock(fakeClock)
 
-	validToken, err := totp.GenerateCode(otpSecret, s.a.clock.Now())
+	validToken, err := totp.GenerateCode(otpSecret, s.a.GetClock().Now())
 	c.Assert(err, IsNil)
 
 	// change password
@@ -158,7 +161,7 @@ func (s *PasswordSuite) TestChangePasswordWithOTP(c *C) {
 	// advance time and make sure we can login again
 	fakeClock.Advance(defaults.AccountLockInterval + time.Second)
 
-	validToken, _ = totp.GenerateCode(otpSecret, s.a.clock.Now())
+	validToken, _ = totp.GenerateCode(otpSecret, s.a.GetClock().Now())
 	req.OldPassword = req.NewPassword
 	req.NewPassword = []byte("abc5555")
 	req.SecondFactorToken = validToken
@@ -214,11 +217,6 @@ func (s *PasswordSuite) prepareForPasswordChange(user string, pass []byte, secon
 		return req, err
 	}
 	err = s.a.UpsertPassword(user, pass)
-	if err != nil {
-		return req, err
-	}
-
-	_, err = s.a.SignIn(user, pass)
 	if err != nil {
 		return req, err
 	}

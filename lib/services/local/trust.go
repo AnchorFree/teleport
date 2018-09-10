@@ -14,9 +14,9 @@ type CA struct {
 }
 
 // NewCAService returns new instance of CAService
-func NewCAService(backend backend.Backend) *CA {
+func NewCAService(b backend.Backend) *CA {
 	return &CA{
-		Backend: backend,
+		Backend: b,
 	}
 }
 
@@ -37,6 +37,9 @@ func (s *CA) CreateCertAuthority(ca services.CertAuthority) error {
 	ttl := backend.TTL(s.Clock(), ca.Expiry())
 	err = s.CreateVal([]string{"authorities", string(ca.GetType())}, ca.GetName(), data, ttl)
 	if err != nil {
+		if trace.IsAlreadyExists(err) {
+			return trace.AlreadyExists("cluster %q already exists", ca.GetName())
+		}
 		return trace.Wrap(err)
 	}
 	return nil
@@ -54,6 +57,32 @@ func (s *CA) UpsertCertAuthority(ca services.CertAuthority) error {
 	ttl := backend.TTL(s.Clock(), ca.Expiry())
 	err = s.UpsertVal([]string{"authorities", string(ca.GetType())}, ca.GetName(), data, ttl)
 	if err != nil {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+// CompareAndSwapCertAuthority updates the cert authority value
+// if the existing value matches existing parameter, returns nil if succeeds,
+// trace.CompareFailed otherwise.
+func (s *CA) CompareAndSwapCertAuthority(new, existing services.CertAuthority) error {
+	if err := new.Check(); err != nil {
+		return trace.Wrap(err)
+	}
+	newData, err := services.GetCertAuthorityMarshaler().MarshalCertAuthority(new)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	existingData, err := services.GetCertAuthorityMarshaler().MarshalCertAuthority(existing)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	ttl := backend.TTL(s.Clock(), new.Expiry())
+	err = s.CompareAndSwapVal([]string{"authorities", string(new.GetType())}, new.GetName(), newData, existingData, ttl)
+	if err != nil {
+		if trace.IsCompareFailed(err) {
+			return trace.CompareFailed("cluster %v settings have been updated, try again", new.GetName())
+		}
 		return trace.Wrap(err)
 	}
 	return nil
@@ -149,57 +178,49 @@ func (s *CA) GetCertAuthority(id services.CertAuthID, loadSigningKeys bool) (ser
 	if err := ca.Check(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if !loadSigningKeys {
-		ca.SetSigningKeys(nil)
-		keyPairs := ca.GetTLSKeyPairs()
-		for i := range keyPairs {
-			keyPairs[i].Key = nil
-		}
-		ca.SetTLSKeyPairs(keyPairs)
-	}
+	setSigningKeys(ca, loadSigningKeys)
 	return ca, nil
 }
 
-// DELETE IN: 2.6.0
-// GetAnyCertAuthority returns activated or deactivated certificate authority
-// by given id whether it is activated or not. This method is used in migrations.
-func (s *CA) GetAnyCertAuthority(id services.CertAuthID) (services.CertAuthority, error) {
-	if err := id.Check(); err != nil {
-		return nil, trace.Wrap(err)
+func setSigningKeys(ca services.CertAuthority, loadSigningKeys bool) {
+	if loadSigningKeys {
+		return
 	}
-	data, err := s.GetVal([]string{"authorities", string(id.Type)}, id.DomainName)
-	if err != nil {
-		if !trace.IsNotFound(err) {
-			return nil, trace.Wrap(err)
-		}
-		data, err = s.GetVal([]string{"authorities", "deactivated", string(id.Type)}, id.DomainName)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
+	ca.SetSigningKeys(nil)
+	keyPairs := ca.GetTLSKeyPairs()
+	for i := range keyPairs {
+		keyPairs[i].Key = nil
 	}
-	return services.GetCertAuthorityMarshaler().UnmarshalCertAuthority(data)
+	ca.SetTLSKeyPairs(keyPairs)
 }
 
 // GetCertAuthorities returns a list of authorities of a given type
 // loadSigningKeys controls whether signing keys should be loaded or not
 func (s *CA) GetCertAuthorities(caType services.CertAuthType, loadSigningKeys bool) ([]services.CertAuthority, error) {
-	cas := []services.CertAuthority{}
 	if err := caType.Check(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	domains, err := s.GetKeys([]string{"authorities", string(caType)})
+
+	// Get all items in the bucket.
+	bucket := []string{"authorities", string(caType)}
+	items, err := s.GetItems(bucket)
 	if err != nil {
-		if trace.IsNotFound(err) {
-			return cas, nil
-		}
 		return nil, trace.Wrap(err)
 	}
-	for _, domain := range domains {
-		ca, err := s.GetCertAuthority(services.CertAuthID{DomainName: domain, Type: caType}, loadSigningKeys)
+
+	// Marshal values into a []services.CertAuthority slice.
+	cas := make([]services.CertAuthority, len(items))
+	for i, item := range items {
+		ca, err := services.GetCertAuthorityMarshaler().UnmarshalCertAuthority(item.Value)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		cas = append(cas, ca)
+		if err := ca.Check(); err != nil {
+			return nil, trace.Wrap(err)
+		}
+		setSigningKeys(ca, loadSigningKeys)
+		cas[i] = ca
 	}
+
 	return cas, nil
 }

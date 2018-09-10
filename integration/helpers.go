@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -9,12 +10,14 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,9 +29,10 @@ import (
 	"github.com/gravitational/teleport/lib/auth/native"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/backend"
-	"github.com/gravitational/teleport/lib/backend/boltbk"
+	"github.com/gravitational/teleport/lib/backend/dir"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/reversetunnel"
 	"github.com/gravitational/teleport/lib/service"
 	"github.com/gravitational/teleport/lib/services"
@@ -37,6 +41,7 @@ import (
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 
+	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	log "github.com/sirupsen/logrus"
@@ -59,17 +64,21 @@ type TeleInstance struct {
 	// Slice of TCP ports used by Teleport services
 	Ports []int
 
-	// Hostname is the name of the host where i isnstance is running
+	// Hostname is the name of the host where instance is running
 	Hostname string
 
 	// Internal stuff...
 	Process *service.TeleportProcess
 	Config  *service.Config
 	Tunnel  reversetunnel.Server
+	Pool    *reversetunnel.AgentPool
 
 	// Nodes is a list of additional nodes
 	// started with this instance
 	Nodes []*service.TeleportProcess
+
+	// UploadEventsC is a channel for upload events
+	UploadEventsC chan *events.UploadEvent
 }
 
 type User struct {
@@ -137,7 +146,8 @@ func NewInstance(cfg InstanceConfig) *TeleInstance {
 		fatalIf(err)
 	}
 	// generate instance secrets (keys):
-	keygen := native.New()
+	keygen, err := native.New(native.PrecomputeKeys(0))
+	fatalIf(err)
 	if cfg.Priv == nil || cfg.Pub == nil {
 		cfg.Priv, cfg.Pub, _ = keygen.GenerateKeyPair("")
 	}
@@ -177,8 +187,9 @@ func NewInstance(cfg InstanceConfig) *TeleInstance {
 	fatalIf(err)
 
 	i := &TeleInstance{
-		Ports:    cfg.Ports,
-		Hostname: cfg.NodeName,
+		Ports:         cfg.Ports,
+		Hostname:      cfg.NodeName,
+		UploadEventsC: make(chan *events.UploadEvent, 100),
 	}
 	secrets := InstanceSecrets{
 		SiteName:     cfg.ClusterName,
@@ -254,7 +265,7 @@ func (s *InstanceSecrets) AsSlice() []*InstanceSecrets {
 }
 
 func (s *InstanceSecrets) GetIdentity() *auth.Identity {
-	i, err := auth.ReadIdentityFromKeyPair(s.PrivKey, s.Cert, s.TLSCert, s.TLSCACert)
+	i, err := auth.ReadIdentityFromKeyPair(s.PrivKey, s.Cert, s.TLSCert, [][]byte{s.TLSCACert})
 	fatalIf(err)
 	return i
 }
@@ -311,26 +322,115 @@ func (i *TeleInstance) Create(trustedSecrets []*InstanceSecrets, enableSSH bool,
 	return i.CreateEx(trustedSecrets, tconf)
 }
 
-// CreateEx creates a new instance of Teleport which trusts a list of other clusters (other
-// instances)
-//
-// Unlike Create() it allows for greater customization because it accepts
-// a full Teleport config structure
-func (i *TeleInstance) CreateEx(trustedSecrets []*InstanceSecrets, tconf *service.Config) error {
+// UserCreds holds user client credentials
+type UserCreds struct {
+	// Key is user client key and certificate
+	Key client.Key
+	// HostCA is a trusted host certificate authority
+	HostCA services.CertAuthority
+}
+
+// SetupUserCreds sets up user credentials for client
+func SetupUserCreds(tc *client.TeleportClient, proxyHost string, creds UserCreds) error {
+	_, err := tc.AddKey(proxyHost, &creds.Key)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	err = tc.AddTrustedCA(creds.HostCA)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+// SetupUser sets up user in the cluster
+func SetupUser(process *service.TeleportProcess, username string, roles []services.Role) error {
+	auth := process.GetAuthServer()
+	teleUser, err := services.NewUser(username)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if len(roles) == 0 {
+		role := services.RoleForUser(teleUser)
+		role.SetLogins(services.Allow, []string{username})
+
+		// allow tests to forward agent, still needs to be passed in client
+		roleOptions := role.GetOptions()
+		roleOptions.ForwardAgent = services.NewBool(true)
+		role.SetOptions(roleOptions)
+
+		err = auth.UpsertRole(role, backend.Forever)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		teleUser.AddRole(role.GetMetadata().Name)
+		roles = append(roles, role)
+	} else {
+		for _, role := range roles {
+			err := auth.UpsertRole(role, backend.Forever)
+			if err != nil {
+				return trace.Wrap(err)
+			}
+			teleUser.AddRole(role.GetName())
+		}
+	}
+	err = auth.UpsertUser(teleUser)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+// GenerateUserCreds generates key to be used by client
+func GenerateUserCreds(process *service.TeleportProcess, username string) (*UserCreds, error) {
+	priv, pub, err := testauthority.New().GenerateKeyPair("")
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	a := process.GetAuthServer()
+	sshCert, x509Cert, err := a.GenerateUserCerts(pub, username, time.Hour, teleport.CertificateFormatStandard)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	clusterName, err := a.GetClusterName()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	ca, err := a.GetCertAuthority(services.CertAuthID{
+		Type:       services.HostCA,
+		DomainName: clusterName.GetClusterName(),
+	}, false)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &UserCreds{
+		HostCA: ca,
+		Key: client.Key{
+			Priv:    priv,
+			Pub:     pub,
+			Cert:    sshCert,
+			TLSCert: x509Cert,
+		},
+	}, nil
+}
+
+// GenerateConfig generates instance config
+func (i *TeleInstance) GenerateConfig(trustedSecrets []*InstanceSecrets, tconf *service.Config) (*service.Config, error) {
 	var err error
 	dataDir, err := ioutil.TempDir("", "cluster-"+i.Secrets.SiteName)
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 	if tconf == nil {
 		tconf = service.MakeDefaultConfig()
 	}
 	tconf.DataDir = dataDir
+	tconf.UploadEventsC = i.UploadEventsC
 	tconf.Auth.ClusterName, err = services.NewClusterName(services.ClusterNameSpecV2{
 		ClusterName: i.Secrets.SiteName,
 	})
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 	tconf.Auth.StaticTokens, err = services.NewStaticTokens(services.StaticTokensSpecV2{
 		StaticTokens: []services.ProvisionToken{
@@ -341,7 +441,7 @@ func (i *TeleInstance) CreateEx(trustedSecrets []*InstanceSecrets, tconf *servic
 		},
 	})
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 	tconf.Auth.Authorities = append(tconf.Auth.Authorities, i.Secrets.GetCAs()...)
 	tconf.Identities = append(tconf.Identities, i.Secrets.GetIdentity())
@@ -361,14 +461,29 @@ func (i *TeleInstance) CreateEx(trustedSecrets []*InstanceSecrets, tconf *servic
 	tconf.Auth.SSHAddr.Addr = net.JoinHostPort(i.Hostname, i.GetPortAuth())
 	tconf.Proxy.SSHAddr.Addr = net.JoinHostPort(i.Hostname, i.GetPortProxy())
 	tconf.Proxy.WebAddr.Addr = net.JoinHostPort(i.Hostname, i.GetPortWeb())
+	tconf.Proxy.PublicAddrs = []utils.NetAddr{{Addr: i.Hostname}}
+
 	tconf.AuthServers = append(tconf.AuthServers, tconf.Auth.SSHAddr)
 	tconf.Auth.StorageConfig = backend.Config{
-		Type:   boltbk.GetName(),
-		Params: backend.Params{"path": dataDir},
+		Type:   dir.GetName(),
+		Params: backend.Params{"path": dataDir + string(os.PathListSeparator) + defaults.BackendDir},
 	}
 
 	tconf.Keygen = testauthority.New()
+	i.Config = tconf
+	return tconf, nil
+}
 
+// CreateEx creates a new instance of Teleport which trusts a list of other clusters (other
+// instances)
+//
+// Unlike Create() it allows for greater customization because it accepts
+// a full Teleport config structure
+func (i *TeleInstance) CreateEx(trustedSecrets []*InstanceSecrets, tconf *service.Config) error {
+	tconf, err := i.GenerateConfig(trustedSecrets, tconf)
+	if err != nil {
+		return trace.Wrap(err)
+	}
 	i.Config = tconf
 	i.Process, err = service.NewTeleport(tconf)
 	if err != nil {
@@ -397,7 +512,7 @@ func (i *TeleInstance) CreateEx(trustedSecrets []*InstanceSecrets, tconf *servic
 
 			// allow tests to forward agent, still needs to be passed in client
 			roleOptions := role.GetOptions()
-			roleOptions.Set(services.ForwardAgent, true)
+			roleOptions.ForwardAgent = services.NewBool(true)
 			role.SetOptions(roleOptions)
 
 			err = auth.UpsertRole(role, backend.Forever)
@@ -416,7 +531,6 @@ func (i *TeleInstance) CreateEx(trustedSecrets []*InstanceSecrets, tconf *servic
 				teleUser.AddRole(role.GetName())
 			}
 		}
-
 		err = auth.UpsertUser(teleUser)
 		if err != nil {
 			return trace.Wrap(err)
@@ -439,46 +553,53 @@ func (i *TeleInstance) CreateEx(trustedSecrets []*InstanceSecrets, tconf *servic
 	return nil
 }
 
-// StartNode starts SSH node and connects it to the cluster.
-func (i *TeleInstance) StartNode(name string, sshPort int) (*service.TeleportProcess, error) {
+// StartNode starts a SSH node and connects it to the cluster.
+func (i *TeleInstance) StartNode(tconf *service.Config) (*service.TeleportProcess, error) {
 	dataDir, err := ioutil.TempDir("", "cluster-"+i.Secrets.SiteName)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	tconf := service.MakeDefaultConfig()
+	tconf.DataDir = dataDir
 
 	authServer := utils.MustParseAddr(net.JoinHostPort(i.Hostname, i.GetPortAuth()))
 	tconf.AuthServers = append(tconf.AuthServers, *authServer)
 	tconf.Token = "token"
-	tconf.HostUUID = name
-	tconf.Hostname = name
-	tconf.DataDir = dataDir
-	tconf.CachePolicy = service.CachePolicy{Enabled: true}
-
+	tconf.UploadEventsC = i.UploadEventsC
+	var ttl time.Duration
+	tconf.CachePolicy = service.CachePolicy{
+		Enabled:   true,
+		RecentTTL: &ttl,
+	}
 	tconf.Auth.Enabled = false
-
 	tconf.Proxy.Enabled = false
 
-	tconf.SSH.Enabled = true
-	tconf.SSH.Addr.Addr = net.JoinHostPort(i.Hostname, fmt.Sprintf("%v", sshPort))
-
+	// Create a new Teleport process and add it to the list of nodes that
+	// compose this "cluster".
 	process, err := service.NewTeleport(tconf)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
 	i.Nodes = append(i.Nodes, process)
 
-	err = process.Start()
+	// Build a list of expected events to wait for before unblocking based off
+	// the configuration passed in.
+	expectedEvents := []string{
+		service.NodeSSHReady,
+	}
+
+	// Start the process and block until the expected events have arrived.
+	receivedEvents, err := startAndWait(process, expectedEvents)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
+	log.Debugf("Teleport node (in instance %v) started: %v/%v events received.",
+		i.Secrets.SiteName, len(expectedEvents), len(receivedEvents))
 	return process, nil
 }
 
-// StartNodeAndProxy starts SSH node and proxy and connects it to the cluster.
+// StartNodeAndProxy starts a SSH node and a Proxy Server and connects it to
+// the cluster.
 func (i *TeleInstance) StartNodeAndProxy(name string, sshPort, proxyWebPort, proxySSHPort int) error {
 	dataDir, err := ioutil.TempDir("", "cluster-"+i.Secrets.SiteName)
 	if err != nil {
@@ -492,8 +613,13 @@ func (i *TeleInstance) StartNodeAndProxy(name string, sshPort, proxyWebPort, pro
 	tconf.Token = "token"
 	tconf.HostUUID = name
 	tconf.Hostname = name
+	tconf.UploadEventsC = i.UploadEventsC
 	tconf.DataDir = dataDir
-	tconf.CachePolicy = service.CachePolicy{Enabled: true}
+	var ttl time.Duration
+	tconf.CachePolicy = service.CachePolicy{
+		Enabled:   true,
+		RecentTTL: &ttl,
+	}
 
 	tconf.Auth.Enabled = false
 
@@ -506,12 +632,30 @@ func (i *TeleInstance) StartNodeAndProxy(name string, sshPort, proxyWebPort, pro
 	tconf.SSH.Enabled = true
 	tconf.SSH.Addr.Addr = net.JoinHostPort(i.Hostname, fmt.Sprintf("%v", sshPort))
 
+	// Create a new Teleport process and add it to the list of nodes that
+	// compose this "cluster".
 	process, err := service.NewTeleport(tconf)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	i.Nodes = append(i.Nodes, process)
-	return process.Start()
+
+	// Build a list of expected events to wait for before unblocking based off
+	// the configuration passed in.
+	expectedEvents := []string{
+		service.ProxySSHReady,
+		service.NodeSSHReady,
+	}
+
+	// Start the process and block until the expected events have arrived.
+	receivedEvents, err := startAndWait(process, expectedEvents)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	log.Debugf("Teleport node and proxy (in instance %v) started: %v/%v events received.",
+		i.Secrets.SiteName, len(expectedEvents), len(receivedEvents))
+	return nil
 }
 
 // ProxyConfig is a set of configuration parameters for Proxy
@@ -526,37 +670,59 @@ type ProxyConfig struct {
 	ReverseTunnelPort int
 }
 
-// StartProxy starts proxy server and adds it to the cluster
+// StartProxy starts another Proxy Server and connects it to the cluster.
 func (i *TeleInstance) StartProxy(cfg ProxyConfig) error {
 	dataDir, err := ioutil.TempDir("", "cluster-"+i.Secrets.SiteName+"-"+cfg.Name)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
 	tconf := service.MakeDefaultConfig()
-	tconf.HostUUID = cfg.Name
-	tconf.Hostname = cfg.Name
-	tconf.DataDir = dataDir
-	tconf.Auth.Enabled = false
-	tconf.Proxy.Enabled = true
-	tconf.SSH.Enabled = false
+
 	authServer := utils.MustParseAddr(net.JoinHostPort(i.Hostname, i.GetPortAuth()))
 	tconf.AuthServers = append(tconf.AuthServers, *authServer)
+	tconf.CachePolicy = service.CachePolicy{Enabled: true}
+	tconf.DataDir = dataDir
+	tconf.UploadEventsC = i.UploadEventsC
+	tconf.HostUUID = cfg.Name
+	tconf.Hostname = cfg.Name
 	tconf.Token = "token"
+
+	tconf.Auth.Enabled = false
+
+	tconf.SSH.Enabled = false
+
 	tconf.Proxy.Enabled = true
 	tconf.Proxy.SSHAddr.Addr = net.JoinHostPort(i.Hostname, fmt.Sprintf("%v", cfg.SSHPort))
 	tconf.Proxy.ReverseTunnelListenAddr.Addr = net.JoinHostPort(i.Hostname, fmt.Sprintf("%v", cfg.ReverseTunnelPort))
 	tconf.Proxy.WebAddr.Addr = net.JoinHostPort(i.Hostname, fmt.Sprintf("%v", cfg.WebPort))
 	tconf.Proxy.DisableReverseTunnel = false
 	tconf.Proxy.DisableWebService = true
-	// Enable caching
-	tconf.CachePolicy = service.CachePolicy{Enabled: true}
 
+	// Create a new Teleport process and add it to the list of nodes that
+	// compose this "cluster".
 	process, err := service.NewTeleport(tconf)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	i.Nodes = append(i.Nodes, process)
-	return process.Start()
+
+	// Build a list of expected events to wait for before unblocking based off
+	// the configuration passed in.
+	expectedEvents := []string{
+		service.ProxyReverseTunnelReady,
+		service.ProxySSHReady,
+	}
+
+	// Start the process and block until the expected events have arrived.
+	receivedEvents, err := startAndWait(process, expectedEvents)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	log.Debugf("Teleport proxy (in instance %v) started: %v/%v events received.",
+		i.Secrets.SiteName, len(expectedEvents), len(receivedEvents))
+	return nil
 }
 
 // Reset re-creates the teleport instance based on the same configuration
@@ -594,52 +760,53 @@ func (i *TeleInstance) AddUser(username string, mappings []string) *User {
 	return user
 }
 
-func (i *TeleInstance) Start() (err error) {
-	proxyReady := make(chan service.Event)
-	sshReady := make(chan service.Event)
-	tunnelReady := make(chan service.Event)
-	allReady := make(chan interface{})
+// Start will start the TeleInstance and then block until it is ready to
+// process requests based off the passed in configuration.
+func (i *TeleInstance) Start() error {
+	// Build a list of expected events to wait for before unblocking based off
+	// the configuration passed in.
+	expectedEvents := []string{}
+	if i.Config.Auth.Enabled {
+		expectedEvents = append(expectedEvents, service.AuthTLSReady)
+	}
+	if i.Config.Proxy.Enabled {
+		expectedEvents = append(expectedEvents, service.ProxyReverseTunnelReady)
+		expectedEvents = append(expectedEvents, service.ProxySSHReady)
+		expectedEvents = append(expectedEvents, service.ProxyAgentPoolReady)
+		if !i.Config.Proxy.DisableWebService {
+			expectedEvents = append(expectedEvents, service.ProxyWebServerReady)
+		}
+	}
+	if i.Config.SSH.Enabled {
+		expectedEvents = append(expectedEvents, service.NodeSSHReady)
+	}
 
-	i.Process.WaitForEvent(service.ProxyIdentityEvent, proxyReady, make(chan struct{}))
-	i.Process.WaitForEvent(service.SSHIdentityEvent, sshReady, make(chan struct{}))
-	i.Process.WaitForEvent(service.ProxyReverseTunnelServerEvent, tunnelReady, make(chan struct{}))
-
-	if err = i.Process.Start(); err != nil {
+	// Start the process and block until the expected events have arrived.
+	receivedEvents, err := startAndWait(i.Process, expectedEvents)
+	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	defer func() {
-		close(sshReady)
-		close(proxyReady)
-	}()
-
-	go func() {
-		if i.Config.SSH.Enabled {
-			<-sshReady
+	// Extract and set reversetunnel.Server and reversetunnel.AgentPool upon
+	// receipt of a ProxyReverseTunnelReady and ProxyAgentPoolReady respectivly.
+	for _, re := range receivedEvents {
+		switch re.Name {
+		case service.ProxyReverseTunnelReady:
+			ts, ok := re.Payload.(reversetunnel.Server)
+			if ok {
+				i.Tunnel = ts
+			}
+		case service.ProxyAgentPoolReady:
+			ap, ok := re.Payload.(*reversetunnel.AgentPool)
+			if ok {
+				i.Pool = ap
+			}
 		}
-		<-proxyReady
-		te := <-tunnelReady
-		ts, ok := te.Payload.(reversetunnel.Server)
-		if !ok {
-			err = fmt.Errorf("Global event '%v' did not deliver reverseTunenl server pointer as a payload", service.ProxyReverseTunnelServerEvent)
-			log.Error(err)
-		}
-		i.Tunnel = ts
-		close(allReady)
-	}()
-
-	timeoutTicker := time.NewTicker(time.Second * 5)
-	defer timeoutTicker.Stop()
-
-	select {
-	case <-allReady:
-		time.Sleep(time.Millisecond * 100)
-		break
-	case <-timeoutTicker.C:
-		return fmt.Errorf("failed to start local Teleport instance: timeout")
 	}
-	log.Infof("Teleport instance '%v' started!", i.Secrets.SiteName)
-	return err
+
+	log.Debugf("Teleport instance %v started: %v/%v events received.",
+		i.Secrets.SiteName, len(receivedEvents), len(expectedEvents))
+	return nil
 }
 
 // ClientConfig is a client configuration
@@ -659,39 +826,44 @@ type ClientConfig struct {
 	ForwardAgent bool
 }
 
-// NewClient returns a fully configured and pre-authenticated client
+// NewClientWithCreds creates client with credentials
+func (i *TeleInstance) NewClientWithCreds(cfg ClientConfig, creds UserCreds) (tc *client.TeleportClient, err error) {
+	clt, err := i.NewUnauthenticatedClient(cfg)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	err = SetupUserCreds(clt, i.Config.Proxy.SSHAddr.Addr, creds)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return clt, nil
+}
+
+// NewUnauthenticatedClient returns a fully configured and pre-authenticated client
 // (pre-authenticated with server CAs and signed session key)
-func (i *TeleInstance) NewClient(cfg ClientConfig) (tc *client.TeleportClient, err error) {
+func (i *TeleInstance) NewUnauthenticatedClient(cfg ClientConfig) (tc *client.TeleportClient, err error) {
 	keyDir, err := ioutil.TempDir(i.Config.DataDir, "tsh")
 	if err != nil {
 		return nil, err
 	}
 
-	// break down proxy address into host, ssh_port and web_port:
 	proxyConf := &i.Config.Proxy
-	proxyHost, sp, err := net.SplitHostPort(proxyConf.SSHAddr.Addr)
+	proxyHost, _, err := net.SplitHostPort(proxyConf.SSHAddr.Addr)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	// use alternative proxy if necessary
-	var proxySSHPort, proxyWebPort int
+	var webProxyAddr string
+	var sshProxyAddr string
+
 	if cfg.Proxy == nil {
-		proxySSHPort, err = strconv.Atoi(sp)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		_, sp, err = net.SplitHostPort(proxyConf.WebAddr.Addr)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		proxyWebPort, err = strconv.Atoi(sp)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
+		webProxyAddr = proxyConf.WebAddr.Addr
+		sshProxyAddr = proxyConf.SSHAddr.Addr
 	} else {
-		proxySSHPort, proxyWebPort = cfg.Proxy.SSHPort, cfg.Proxy.WebPort
+		webProxyAddr = net.JoinHostPort(proxyHost, strconv.Itoa(cfg.Proxy.WebPort))
+		sshProxyAddr = net.JoinHostPort(proxyHost, strconv.Itoa(cfg.Proxy.SSHPort))
 	}
+
 	cconf := &client.Config{
 		Username:           cfg.Login,
 		Host:               cfg.Host,
@@ -701,14 +873,22 @@ func (i *TeleInstance) NewClient(cfg ClientConfig) (tc *client.TeleportClient, e
 		KeysDir:            keyDir,
 		SiteName:           cfg.Cluster,
 		ForwardAgent:       cfg.ForwardAgent,
+		WebProxyAddr:       webProxyAddr,
+		SSHProxyAddr:       sshProxyAddr,
 	}
-	cconf.SetProxy(proxyHost, proxyWebPort, proxySSHPort)
 
-	tc, err = client.NewClient(cconf)
+	return client.NewClient(cconf)
+}
+
+// NewClient returns a fully configured and pre-authenticated client
+// (pre-authenticated with server CAs and signed session key)
+func (i *TeleInstance) NewClient(cfg ClientConfig) (*client.TeleportClient, error) {
+	tc, err := i.NewUnauthenticatedClient(cfg)
 	if err != nil {
-		return nil, err
+		return nil, trace.Wrap(err)
 	}
-	// confnigures the client authenticate using the keys from 'secrets':
+
+	// configures the client authenticate using the keys from 'secrets':
 	user, ok := i.Secrets.Users[cfg.Login]
 	if !ok {
 		return nil, trace.BadParameter("unknown login %q", cfg.Login)
@@ -730,6 +910,27 @@ func (i *TeleInstance) NewClient(cfg ClientConfig) (tc *client.TeleportClient, e
 		}
 	}
 	return tc, nil
+}
+
+// StopProxy loops over the extra nodes in a TeleInstance and stops all
+// nodes where the proxy server is enabled.
+func (i *TeleInstance) StopProxy() error {
+	var errors []error
+
+	for _, p := range i.Nodes {
+		if p.Config.Proxy.Enabled {
+			if err := p.Close(); err != nil {
+				errors = append(errors, err)
+				log.Errorf("Failed closing extra proxy: %v.", err)
+			}
+			if err := p.Wait(); err != nil {
+				errors = append(errors, err)
+				log.Errorf("Failed to stop extra proxy: %v.", err)
+			}
+		}
+	}
+
+	return trace.NewAggregate(errors...)
 }
 
 // StopNodes stops additional nodes
@@ -768,6 +969,43 @@ func (i *TeleInstance) Stop(removeData bool) error {
 	return i.Process.Wait()
 }
 
+func startAndWait(process *service.TeleportProcess, expectedEvents []string) ([]service.Event, error) {
+	// register to listen for all ready events on the broadcast channel
+	broadcastCh := make(chan service.Event)
+	for _, eventName := range expectedEvents {
+		process.WaitForEvent(context.TODO(), eventName, broadcastCh)
+	}
+
+	// start the process
+	err := process.Start()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// wait for all events to arrive or a timeout. if all the expected events
+	// from above are not received, this instance will not start
+	receivedEvents := []service.Event{}
+	timeoutCh := time.After(10 * time.Second)
+
+	for idx := 0; idx < len(expectedEvents); idx++ {
+		select {
+		case e := <-broadcastCh:
+			receivedEvents = append(receivedEvents, e)
+		case <-timeoutCh:
+			return nil, trace.BadParameter("timed out, only %v/%v events received. received: %v, expected: %v",
+				len(receivedEvents), len(expectedEvents), receivedEvents, expectedEvents)
+		}
+	}
+
+	// Not all services follow a non-blocking Start/Wait pattern. This means a
+	// *Ready event may be emit slightly before the service actually starts for
+	// blocking services. Long term those services should be re-factored, until
+	// then sleep for 250ms to handle this situation.
+	time.Sleep(250 * time.Millisecond)
+
+	return receivedEvents, nil
+}
+
 type proxyServer struct {
 	sync.Mutex
 	count int
@@ -777,7 +1015,7 @@ type proxyServer struct {
 // the specified host. Also tracks the number of connections that it proxies for
 // debugging purposes.
 func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// validate http connect parameters
+	// Validate http connect parameters.
 	if r.Method != http.MethodConnect {
 		trace.WriteError(w, trace.BadParameter("%v not supported", r.Method))
 		return
@@ -787,7 +1025,20 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// hijack request so we can get underlying connection
+	// Dial to the target host, this is done before hijacking the connection to
+	// ensure the target host is accessible.
+	dconn, err := net.Dial("tcp", r.Host)
+	if err != nil {
+		trace.WriteError(w, err)
+		return
+	}
+	defer dconn.Close()
+
+	// Once the client receives 200 OK, the rest of the data will no longer be
+	// http, but whatever protocol is being tunneled.
+	w.WriteHeader(http.StatusOK)
+
+	// Hijack request so we can get underlying connection.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		trace.WriteError(w, trace.AccessDenied("unable to hijack connection"))
@@ -800,34 +1051,12 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sconn.Close()
 
-	// dial to host we want to proxy connection to
-	dconn, err := net.Dial("tcp", r.Host)
-	if err != nil {
-		trace.WriteError(w, err)
-		return
-	}
-	defer dconn.Close()
-
-	// write 200 OK to the source, but don't close the connection
-	resp := &http.Response{
-		Status:     "OK",
-		StatusCode: 200,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 0,
-	}
-	err = resp.Write(sconn)
-	if err != nil {
-		trace.WriteError(w, err)
-		return
-	}
-
-	// success, we're proxying data now
+	// Success, we're proxying data now.
 	p.Lock()
 	p.count = p.count + 1
 	p.Unlock()
 
-	// copy from src to dst and dst to src
+	// Copy from src to dst and dst to src.
 	errc := make(chan error, 2)
 	replicate := func(dst io.Writer, src io.Reader) {
 		_, err := io.Copy(dst, src)
@@ -836,7 +1065,7 @@ func (p *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go replicate(sconn, dconn)
 	go replicate(dconn, sconn)
 
-	// wait until done, error, or 10 second
+	// Wait until done, error, or 10 second.
 	select {
 	case <-time.After(10 * time.Second):
 	case <-errc:
@@ -924,46 +1153,73 @@ func (s *discardServer) handleChannel(channel ssh.Channel, reqs <-chan *ssh.Requ
 	}
 }
 
+// commandOptions controls how the SSH command is built.
+type commandOptions struct {
+	forwardAgent bool
+	forcePTY     bool
+	controlPath  string
+	socketPath   string
+	proxyPort    string
+	nodePort     string
+	command      string
+}
+
 // externalSSHCommand runs an external SSH command (if an external ssh binary
 // exists) with the passed in parameters.
-func externalSSHCommand(forwardAgent bool, socketPath string, proxyPort string, nodePort string, command string) (*exec.Cmd, error) {
+func externalSSHCommand(o commandOptions) (*exec.Cmd, error) {
 	var execArgs []string
 
-	// don't check the host certificate during tests
+	// Don't check the host certificate as part of the testing an external SSH
+	// client, this is done elsewhere.
 	execArgs = append(execArgs, "-oStrictHostKeyChecking=no")
 	execArgs = append(execArgs, "-oUserKnownHostsFile=/dev/null")
 
-	// connect to node on the passed in port
-	execArgs = append(execArgs, "-p")
-	execArgs = append(execArgs, nodePort)
-
-	// build proxy command
-	var proxyCommand string
-	switch forwardAgent {
-	case true:
-		proxyCommand = fmt.Sprintf("ProxyCommand ssh -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oForwardAgent=yes -p %v %%r@localhost -s proxy:%%h:%%p", proxyPort)
-	case false:
-		proxyCommand = fmt.Sprintf("ProxyCommand ssh -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -p %v %%r@localhost -s proxy:%%h:%%p", proxyPort)
+	// ControlMaster is often used by applications like Ansible.
+	if o.controlPath != "" {
+		execArgs = append(execArgs, "-oControlMaster=auto")
+		execArgs = append(execArgs, "-oControlPersist=1s")
+		execArgs = append(execArgs, "-oConnectTimeout=2")
+		execArgs = append(execArgs, fmt.Sprintf("-oControlPath=%v", o.controlPath))
 	}
-	execArgs = append(execArgs, "-o")
-	execArgs = append(execArgs, proxyCommand)
 
-	// add in the host the connect to and the command to run when connected
+	// The -tt flag is used to force PTY allocation. It's often used by
+	// applications like Ansible.
+	if o.forcePTY {
+		execArgs = append(execArgs, "-tt")
+	}
+
+	// Connect to node on the passed in port.
+	execArgs = append(execArgs, fmt.Sprintf("-p %v", o.nodePort))
+
+	// Build proxy command.
+	proxyCommand := []string{"ssh"}
+	proxyCommand = append(proxyCommand, "-oStrictHostKeyChecking=no")
+	proxyCommand = append(proxyCommand, "-oUserKnownHostsFile=/dev/null")
+	if o.forwardAgent {
+		proxyCommand = append(proxyCommand, "-oForwardAgent=yes")
+	}
+	proxyCommand = append(proxyCommand, fmt.Sprintf("-p %v", o.proxyPort))
+	proxyCommand = append(proxyCommand, `%r@localhost -s proxy:%h:%p`)
+
+	// Add in ProxyCommand option, needed for all Teleport connections.
+	execArgs = append(execArgs, fmt.Sprintf("-oProxyCommand=%v", strings.Join(proxyCommand, " ")))
+
+	// Add in the host to connect to and the command to run when connected.
 	execArgs = append(execArgs, Host)
-	execArgs = append(execArgs, command)
+	execArgs = append(execArgs, o.command)
 
-	// find the ssh binary
+	// Find the OpenSSH binary.
 	sshpath, err := exec.LookPath("ssh")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	// create exec command and tell it where to find the ssh agent
+	// Create an exec.Command and tell it where to find the SSH agent.
 	cmd, err := exec.Command(sshpath, execArgs...), nil
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	cmd.Env = []string{fmt.Sprintf("SSH_AUTH_SOCK=%v", socketPath)}
+	cmd.Env = []string{fmt.Sprintf("SSH_AUTH_SOCK=%v", o.socketPath)}
 
 	return cmd, nil
 }
@@ -1033,6 +1289,24 @@ func closeAgent(teleAgent *teleagent.AgentServer, socketDirPath string) error {
 	return nil
 }
 
+// createWebClient builds a *client.WebClient that is used to simulate
+// browser requests.
+func createWebClient(cluster *TeleInstance, opts ...roundtrip.ClientParam) (*client.WebClient, error) {
+	// Craft URL to Web UI.
+	u := &url.URL{
+		Scheme: "https",
+		Host:   cluster.Config.Proxy.WebAddr.Addr,
+	}
+
+	opts = append(opts, roundtrip.HTTPClient(client.NewInsecureWebClient()))
+	wc, err := client.NewWebClient(u.String(), opts...)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return wc, nil
+}
+
 func fatalIf(err error) {
 	if err != nil {
 		log.Fatalf("%v at %v", string(debug.Stack()), err)
@@ -1040,6 +1314,10 @@ func fatalIf(err error) {
 }
 
 func makeKey() (priv, pub []byte) {
-	priv, pub, _ = native.New().GenerateKeyPair("")
+	k, err := native.New(native.PrecomputeKeys(0))
+	if err != nil {
+		panic(err)
+	}
+	priv, pub, _ = k.GenerateKeyPair("")
 	return priv, pub
 }

@@ -12,7 +12,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
 */
 
 package client
@@ -29,14 +28,15 @@ import (
 // NewKey generates a new unsigned key. Such key must be signed by a
 // Teleport CA (auth server) before it becomes useful.
 func NewKey() (key *Key, err error) {
-	key = &Key{}
-	keygen := native.New()
-	defer keygen.Close()
-	key.Priv, key.Pub, err = keygen.GenerateKeyPair("")
+	priv, pub, err := native.GenerateKeyPair("")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return key, nil
+
+	return &Key{
+		Priv: priv,
+		Pub:  pub,
+	}, nil
 }
 
 // IdentityFileFormat describes possible file formats how a user identity can be sotred
@@ -100,6 +100,9 @@ func MakeIdentityFile(filePath string, key *Key, format IdentityFileFormat) (err
 		if err != nil {
 			return trace.Wrap(err)
 		}
+	default:
+		return trace.BadParameter("unsupported identity format: %q, use either %q or %q",
+			format, IdentityFormatFile, IdentityFormatOpenSSH)
 	}
 	return nil
 }

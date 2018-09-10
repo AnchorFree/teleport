@@ -1,8 +1,8 @@
 package client
 
 import (
-	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -15,6 +15,9 @@ import (
 type ProfileOptions int
 
 const (
+	// ProfileCreateNew creates new profile, but does not update current profile
+	ProfileCreateNew = 0
+	// ProfileMakeCurrent creates a new profile and makes it current
 	ProfileMakeCurrent = 1 << iota
 )
 
@@ -32,16 +35,16 @@ const CurrentProfileSymlink = "profile"
 // type fewer CLI args.
 //
 type ClientProfile struct {
-	//
-	// proxy configuration
-	//
-	ProxyHost    string `yaml:"proxy_host,omitempty"`
-	ProxySSHPort int    `yaml:"proxy_port,omitempty"`
-	ProxyWebPort int    `yaml:"proxy_web_port,omitempty"`
+	// WebProxyAddr is the host:port the web proxy can be accessed at.
+	WebProxyAddr string `yaml:"web_proxy_addr,omitempty"`
 
-	//
-	// auth/identity
-	//
+	// SSHProxyAddr is the host:port the SSH proxy can be accessed at.
+	SSHProxyAddr string `yaml:"ssh_proxy_addr,omitempty"`
+
+	// KubeProxyAddr is the host:port the Kubernetes proxy can be accessed at.
+	KubeProxyAddr string `yaml:"kube_proxy_addr,omitempty"`
+
+	// Username is the Teleport username for the client.
 	Username string `yaml:"user,omitempty"`
 
 	// AuthType (like "google")
@@ -50,10 +53,29 @@ type ClientProfile struct {
 	// SiteName is equivalient to --cluster argument
 	SiteName string `yaml:"cluster,omitempty"`
 
-	//
-	// other stuff
-	//
+	// ForwardedPorts is the list of ports to forward to the target node.
 	ForwardedPorts []string `yaml:"forward_ports,omitempty"`
+
+	// DELETE IN: 3.1.0
+	// The following fields have been deprecated and replaced with
+	// "proxy_web_addr" and "proxy_ssh_addr".
+	ProxyHost    string `yaml:"proxy_host,omitempty"`
+	ProxySSHPort int    `yaml:"proxy_port,omitempty"`
+	ProxyWebPort int    `yaml:"proxy_web_port,omitempty"`
+}
+
+// Name returns the name of the profile.
+func (c *ClientProfile) Name() string {
+	if c.ProxyHost != "" {
+		return c.ProxyHost
+	}
+
+	addr, _, err := net.SplitHostPort(c.WebProxyAddr)
+	if err != nil {
+		return c.WebProxyAddr
+	}
+
+	return addr
 }
 
 // FullProfilePath returns the full path to the user profile directory.
@@ -120,41 +142,4 @@ func (cp *ClientProfile) SaveTo(filePath string, opts ProfileOptions) error {
 		err = os.Symlink(filepath.Base(filePath), symlink)
 	}
 	return trace.Wrap(err)
-}
-
-// LogoutFromEverywhere looks at the list of proxy servers tsh is currently logged into
-// by examining ~/.tsh and logs him out of them all
-func LogoutFromEverywhere(username string) error {
-	// if no --user flag was passed, get the current OS user:
-	if username == "" {
-		me, err := user.Current()
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		username = me.Username
-	}
-	// load all current keys:
-	agent, err := NewLocalAgent("", username)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	keys, err := agent.GetKeys(username)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	if len(keys) == 0 {
-		fmt.Printf("%s is not logged in\n", username)
-		return nil
-	}
-	// ... and delete them:
-	for _, key := range keys {
-		err = agent.DeleteKey(key.ProxyHost, username)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error logging %s out of %s: %s\n",
-				username, key.ProxyHost, err)
-		} else {
-			fmt.Printf("logged %s out of %s\n", username, key.ProxyHost)
-		}
-	}
-	return nil
 }

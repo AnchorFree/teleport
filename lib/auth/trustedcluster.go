@@ -18,7 +18,6 @@ limitations under the License.
 package auth
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -29,6 +28,7 @@ import (
 	"github.com/gravitational/teleport/lib/httplib"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
@@ -149,6 +149,11 @@ func (a *AuthServer) UpsertTrustedCluster(trustedCluster services.TrustedCluster
 func (a *AuthServer) checkLocalRoles(roleMap services.RoleMap) error {
 	for _, mapping := range roleMap {
 		for _, localRole := range mapping.Local {
+			// expansion means dynamic mapping is in place,
+			// so local role is undefined
+			if utils.ContainsExpansion(localRole) {
+				continue
+			}
 			_, err := a.GetRole(localRole)
 			if err != nil {
 				if trace.IsNotFound(err) {
@@ -441,10 +446,6 @@ func (a *AuthServer) validateTrustedClusterToken(token string) error {
 		return trace.AccessDenied("role does not match")
 	}
 
-	if !a.checkTokenTTL(token) {
-		return trace.AccessDenied("expired token")
-	}
-
 	return nil
 }
 
@@ -454,18 +455,24 @@ func (s *AuthServer) sendValidateRequestToProxy(host string, validateRequest *Va
 		Host:   host,
 	}
 
-	var opts []roundtrip.ClientParam
+	opts := []roundtrip.ClientParam{
+		roundtrip.SanitizerEnabled(true),
+	}
 
 	if lib.IsInsecureDevMode() {
 		log.Warn("The setting insecureSkipVerify is used to communicate with proxy. Make sure you intend to run Teleport in insecure mode!")
 
-		// get the default transport (so we can get the proxy from environment)
-		// but disable tls certificate checking.
+		// Get the default transport, this allows picking up proxy from the
+		// environment.
 		tr, ok := http.DefaultTransport.(*http.Transport)
 		if !ok {
 			return nil, trace.BadParameter("unable to get default transport")
 		}
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
+		// Disable certificate checking while in debug mode.
+		tlsConfig := utils.TLSConfig(s.cipherSuites)
+		tlsConfig.InsecureSkipVerify = true
+		tr.TLSClientConfig = tlsConfig
 
 		insecureWebClient := &http.Client{
 			Transport: tr,

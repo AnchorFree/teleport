@@ -58,10 +58,14 @@ func (s *EtcdSuite) SetUpSuite(c *C) {
 		"tls_ca_file":   "../../../examples/etcd/certs/ca-cert.pem",
 	}
 	// Initiate a backend with a registry
-	b, err := New(s.config)
+	raw, err := New(s.config)
 	c.Assert(err, IsNil)
-	s.bk = b.(*bk)
-	s.suite.B = b
+
+	sb, ok := raw.(*backend.Sanitizer)
+	c.Assert(ok, Equals, true)
+
+	s.bk = sb.Backend().(*bk)
+	s.suite.B = raw
 }
 
 func (s *EtcdSuite) SetUpTest(c *C) {
@@ -101,6 +105,14 @@ func (s *EtcdSuite) TearDownTest(c *C) {
 
 func (s *EtcdSuite) TestBasicCRUD(c *C) {
 	s.suite.BasicCRUD(c)
+}
+
+func (s *EtcdSuite) TestBatchCRUD(c *C) {
+	s.suite.BatchCRUD(c)
+}
+
+func (s *EtcdSuite) TestCompareAndSwap(c *C) {
+	s.suite.CompareAndSwap(c)
 }
 
 func (s *EtcdSuite) TestExpiration(c *C) {

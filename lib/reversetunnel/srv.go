@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,15 +34,40 @@ import (
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/sshca"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/state"
 	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 )
+
+var (
+	remoteClustersStats = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "remote_clusters",
+			Help: "Number inbound connections from remote clusters and clusters stats",
+		},
+		[]string{"cluster"},
+	)
+	trustedClustersStats = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "trusted_clusters",
+			Help: "Number of tunnels per state",
+		},
+		[]string{"cluster", "state"},
+	)
+)
+
+func init() {
+	// Metrics have to be registered to be exposed:
+	prometheus.MustRegister(remoteClustersStats)
+	prometheus.MustRegister(trustedClustersStats)
+}
 
 // server is a "reverse tunnel server". it exposes the cluster capabilities
 // (like access to a cluster's auth) to remote trusted clients
@@ -128,6 +154,10 @@ type Config struct {
 	// wall clock if not set
 	Clock clockwork.Clock
 
+	// KeyGen is a process wide key generator. It is shared to speed up
+	// generation of public/private keypairs.
+	KeyGen sshca.Authority
+
 	// Ciphers is a list of ciphers that the server supports. If omitted,
 	// the defaults will be used.
 	Ciphers []string
@@ -139,6 +169,12 @@ type Config struct {
 	// MACAlgorithms is a list of message authentication codes (MAC) that
 	// the server supports. If omitted the defaults will be used.
 	MACAlgorithms []string
+
+	// DataDir is a local server data directory
+	DataDir string
+	// PollingPeriod specifies polling period for internal sync
+	// goroutines, used to speed up sync-ups in tests.
+	PollingPeriod time.Duration
 }
 
 // CheckAndSetDefaults checks parameters and sets default values
@@ -155,8 +191,14 @@ func (cfg *Config) CheckAndSetDefaults() error {
 	if cfg.Listener == nil {
 		return trace.BadParameter("missing parameter Listener")
 	}
+	if cfg.DataDir == "" {
+		return trace.BadParameter("missing parameter DataDir")
+	}
 	if cfg.Context == nil {
 		cfg.Context = context.TODO()
+	}
+	if cfg.PollingPeriod == 0 {
+		cfg.PollingPeriod = defaults.HighResPollingPeriod
 	}
 	if cfg.Limiter == nil {
 		var err error
@@ -214,12 +256,15 @@ func NewServer(cfg Config) (Server, error) {
 			PublicKey: srv.keyAuth,
 		},
 		sshutils.SetLimiter(cfg.Limiter),
+		sshutils.SetCiphers(cfg.Ciphers),
+		sshutils.SetKEXAlgorithms(cfg.KEXAlgorithms),
+		sshutils.SetMACAlgorithms(cfg.MACAlgorithms),
 	)
 	if err != nil {
 		return nil, err
 	}
-	srv.hostCertChecker = ssh.CertChecker{IsAuthority: srv.isHostAuthority}
-	srv.userCertChecker = ssh.CertChecker{IsAuthority: srv.isUserAuthority}
+	srv.userCertChecker = ssh.CertChecker{IsUserAuthority: srv.isUserAuthority}
+	srv.hostCertChecker = ssh.CertChecker{IsHostAuthority: srv.isHostAuthority}
 	srv.srv = s
 	go srv.periodicFunctions()
 	return srv, nil
@@ -279,6 +324,10 @@ func (s *server) periodicFunctions() {
 			if err != nil {
 				s.Warningf("Failed to disconnect clusters: %v.", err)
 			}
+			err = s.reportClusterStats()
+			if err != nil {
+				s.Warningf("Failed to report cluster stats: %v.", err)
+			}
 		}
 	}
 }
@@ -307,6 +356,23 @@ func (s *server) fetchClusterPeers() error {
 	s.removeClusterPeers(connsToRemove)
 	s.updateClusterPeers(connsToUpdate)
 	return s.addClusterPeers(connsToAdd)
+}
+
+func (s *server) reportClusterStats() error {
+	defer func() {
+		if r := recover(); r != nil {
+			s.Warningf("Recovered from panic: %v.", r)
+		}
+	}()
+	clusters := s.GetSites()
+	for _, cluster := range clusters {
+		gauge, err := remoteClustersStats.GetMetricWithLabelValues(cluster.GetName())
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		gauge.Set(float64(cluster.GetTunnelsCount()))
+	}
+	return nil
 }
 
 func (s *server) addClusterPeers(conns map[string]services.TunnelConnection) error {
@@ -402,7 +468,7 @@ func (s *server) diffConns(newConns, existingConns map[string]services.TunnelCon
 }
 
 func (s *server) Wait() {
-	s.srv.Wait()
+	s.srv.Wait(context.TODO())
 }
 
 func (s *server) Start() error {
@@ -413,6 +479,11 @@ func (s *server) Start() error {
 func (s *server) Close() error {
 	s.cancel()
 	return s.srv.Close()
+}
+
+func (s *server) Shutdown(ctx context.Context) error {
+	s.cancel()
+	return s.srv.Shutdown(ctx)
 }
 
 func (s *server) HandleNewChan(conn net.Conn, sconn *ssh.ServerConn, nch ssh.NewChannel) {
@@ -458,7 +529,7 @@ func (s *server) HandleNewChan(conn net.Conn, sconn *ssh.ServerConn, nch ssh.New
 
 // isHostAuthority is called during checking the client key, to see if the signing
 // key is the real host CA authority key.
-func (s *server) isHostAuthority(auth ssh.PublicKey) bool {
+func (s *server) isHostAuthority(auth ssh.PublicKey, address string) bool {
 	keys, err := s.getTrustedCAKeys(services.HostCA)
 	if err != nil {
 		s.Errorf("failed to retrieve trusted keys, err: %v", err)
@@ -546,7 +617,17 @@ func (s *server) keyAuth(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permiss
 			logger.Warningf("Failed to authenticate host, err: %v.", err)
 			return nil, err
 		}
-		err := s.hostCertChecker.CheckHostKey(conn.User(), conn.RemoteAddr(), key)
+		// CheckHostKey expects the addr that is passed in to be in the format
+		// host:port. This is because this function is usually used by a client to
+		// check if the host it attempted to connect to presented a certificate for
+		// the host requested (this prevents man-in-the-middle attacks).
+		//
+		// In this situation however, it's a server essentially performing user
+		// authentication, but since it's machine-to-machine communication, the
+		// "user" is presenting a host certificate. To make CheckHostKey behave
+		// like Authenticate we pass in a addr in the host:port format it expects.
+		addr := formatAddr(conn.User())
+		err := s.hostCertChecker.CheckHostKey(addr, conn.RemoteAddr(), key)
 		if err != nil {
 			logger.Warningf("Failed to authenticate host, err: %v.", err)
 			return nil, trace.Wrap(err)
@@ -801,7 +882,7 @@ func newRemoteSite(srv *server, domainName string) (*remoteSite, error) {
 	remoteSite.localClient = srv.localAuthClient
 	remoteSite.localAccessPoint = srv.localAccessPoint
 
-	clt, isLegacyRemoteCluster, err := remoteSite.getRemoteClient()
+	clt, _, err := remoteSite.getRemoteClient()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -819,20 +900,39 @@ func newRemoteSite(srv *server, domainName string) (*remoteSite, error) {
 	// certificate cache is created in each site (instead of creating it in
 	// reversetunnel.server and passing it along) so that the host certificate
 	// is signed by the correct certificate authority.
-	certificateCache, err := NewHostCertificateCache(srv.localAuthClient)
+	certificateCache, err := NewHostCertificateCache(srv.Config.KeyGen, srv.localAuthClient)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	remoteSite.certificateCache = certificateCache
 
 	go remoteSite.periodicSendDiscoveryRequests()
-
-	// if remote cluster is legacy, attempt periodic certificate exchanges
-	if isLegacyRemoteCluster {
-		go remoteSite.periodicAttemptCertExchange()
-	}
+	go remoteSite.periodicUpdateCertAuthorities()
 
 	return remoteSite, nil
+}
+
+// formatAddr adds :port to the passed in string if it's not in
+// host:port format.
+func formatAddr(s string) string {
+	i := strings.Index(s, ":")
+	if i == -1 {
+		return s + ":0"
+	}
+	if i == len(s)-1 {
+		return s[:len(s)-1] + ":0"
+	}
+
+	port, err := strconv.Atoi(s[i+1:])
+	if err != nil {
+		return s[:i] + ":0"
+	}
+
+	if port < 0 || port > 65535 {
+		return s[:i] + ":0"
+	}
+
+	return s
 }
 
 const (

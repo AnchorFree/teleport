@@ -88,7 +88,9 @@ func New(params backend.Params) (backend.Backend, error) {
 	if err = b.reconnect(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return b, nil
+
+	// Wrap backend in a input sanitizer and return it.
+	return backend.NewSanitizer(b), nil
 }
 
 // Validate checks if all the parameters are present/valid
@@ -149,12 +151,29 @@ func (b *bk) reconnect() error {
 	return nil
 }
 
-func (b *bk) GetKeys(path []string) ([]string, error) {
-	keys, err := b.getKeys(b.key(path...))
+// GetItems fetches keys and values and returns them to the caller.
+func (b *bk) GetItems(path []string) ([]backend.Item, error) {
+	items, err := b.getItems(b.key(path...))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	sort.Sort(sort.StringSlice(keys))
+
+	return items, nil
+}
+
+// GetKeys fetches keys (and values) but only returns keys to the caller.
+func (b *bk) GetKeys(path []string) ([]string, error) {
+	items, err := b.getItems(b.key(path...))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Convert from []backend.Item to []string and return keys.
+	keys := make([]string, len(items))
+	for i, e := range items {
+		keys[i] = e.Key
+	}
+
 	return keys, nil
 }
 
@@ -166,8 +185,32 @@ func (b *bk) CreateVal(path []string, key string, val []byte, ttl time.Duration)
 	return trace.Wrap(convertErr(err))
 }
 
+// CompareAndSwapVal compares and swap values in atomic operation,
+// succeeds if prevVal matches the value stored in the databases,
+// requires prevVal as a non-empty value. Returns trace.CompareFailed
+// in case if value did not match
+func (b *bk) CompareAndSwapVal(path []string, key string, val []byte, prevVal []byte, ttl time.Duration) error {
+	if len(prevVal) == 0 {
+		return trace.BadParameter("missing prevVal parameter, to atomically create item, use CreateVal method")
+	}
+	encodedPrev := base64.StdEncoding.EncodeToString(prevVal)
+	_, err := b.api.Set(
+		context.Background(),
+		b.key(append(path, key)...), base64.StdEncoding.EncodeToString(val),
+		&client.SetOptions{PrevValue: encodedPrev, PrevExist: client.PrevExist, TTL: ttl})
+	err = convertErr(err)
+	if trace.IsNotFound(err) {
+		return trace.CompareFailed(err.Error())
+	}
+	return trace.Wrap(err)
+}
+
 // maxOptimisticAttempts is the number of attempts optimistic locking
 const maxOptimisticAttempts = 5
+
+func (bk *bk) UpsertItems(bucket []string, items []backend.Item) error {
+	return trace.BadParameter("not implemented")
+}
 
 func (b *bk) UpsertVal(path []string, key string, val []byte, ttl time.Duration) error {
 	_, err := b.api.Set(
@@ -226,22 +269,39 @@ func (b *bk) ReleaseLock(token string) error {
 	return convertErr(err)
 }
 
-func (b *bk) getKeys(key string) ([]string, error) {
-	var vals []string
-	re, err := b.api.Get(context.Background(), key, nil)
-	err = convertErr(err)
-	if err != nil {
-		if trace.IsNotFound(err) {
+// getItems fetches keys and values and returns them to the caller.
+func (b *bk) getItems(path string) ([]backend.Item, error) {
+	var vals []backend.Item
+
+	re, err := b.api.Get(context.Background(), path, nil)
+	if er := convertErr(err); er != nil {
+		if trace.IsNotFound(er) {
 			return vals, nil
 		}
-		return nil, trace.Wrap(err)
+		return nil, trace.Wrap(er)
 	}
 	if !isDir(re.Node) {
-		return nil, trace.BadParameter("'%v': expected directory", key)
+		return nil, trace.BadParameter("'%v': expected directory", path)
 	}
+
+	// Convert etcd response of *client.Response to backend.Item.
 	for _, n := range re.Node.Nodes {
-		vals = append(vals, suffix(n.Key))
+		valueBytes, err := base64.StdEncoding.DecodeString(n.Value)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		vals = append(vals, backend.Item{
+			Key:   suffix(n.Key),
+			Value: valueBytes,
+		})
 	}
+
+	// Sort and return results.
+	sort.Slice(vals, func(i, j int) bool {
+		return vals[i].Key < vals[j].Key
+	})
+
 	return vals, nil
 }
 

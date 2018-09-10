@@ -19,12 +19,15 @@ package auth
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"net/http"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/limiter"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
 )
@@ -37,6 +40,13 @@ type TLSServerConfig struct {
 	APIConfig
 	// LimiterConfig is limiter config
 	LimiterConfig limiter.LimiterConfig
+	// AccessPoint is caching access point
+	AccessPoint AccessPoint
+	// Component is used for debugging purposes
+	Component string
+	// AcceptedUsage restricts authentication
+	// to a subset of certificates based on the metadata
+	AcceptedUsage []string
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -54,8 +64,8 @@ func (c *TLSServerConfig) CheckAndSetDefaults() error {
 	if len(c.TLS.Certificates) == 0 {
 		return trace.BadParameter("missing parameter TLS.Certificates")
 	}
-	if c.AuthServer == nil {
-		return trace.BadParameter("missing parameter AuthServer")
+	if c.AccessPoint == nil {
+		return trace.BadParameter("missing parameter AccessPoint")
 	}
 	return nil
 }
@@ -81,12 +91,16 @@ func NewTLSServer(cfg TLSServerConfig) (*TLSServer, error) {
 	// authMiddleware authenticates request assuming TLS client authentication
 	// adds authentication infromation to the context
 	// and passes it to the API server
-	authMiddleware := &AuthMiddleware{AuthServer: cfg.AuthServer}
+	authMiddleware := &AuthMiddleware{
+		AccessPoint:   cfg.AccessPoint,
+		AcceptedUsage: cfg.AcceptedUsage,
+	}
 	authMiddleware.Wrap(NewAPIServer(&cfg.APIConfig))
 	// Wrap sets the next middleware in chain to the authMiddleware
 	limiter.WrapHandle(authMiddleware)
 	// force client auth if given
 	cfg.TLS.ClientAuth = tls.VerifyClientCertIfGiven
+
 	server := &TLSServer{
 		TLSServerConfig: cfg,
 		Server: &http.Server{
@@ -125,10 +139,17 @@ func (t *TLSServer) GetConfigForClient(info *tls.ClientHelloInfo) (*tls.Config, 
 
 // AuthMiddleware is authentication middleware checking every request
 type AuthMiddleware struct {
-	// AuthServer is underlying auth server used to authenticate requests
-	AuthServer *AuthServer
+	// AccessPoint is a caching access point for auth server
+	AccessPoint AccessPoint
 	// Handler is HTTP handler called after the middleware checks requests
 	Handler http.Handler
+	// AcceptedUsage restricts authentication
+	// to a subset of certificates based on certificate metadata,
+	// for example middleware can reject certificates with mismatching usage.
+	// If empty, will only accept certificates with non-limited usage,
+	// if set, will accept certificates with non-limited usage,
+	// and usage exactly matching the specified values.
+	AcceptedUsage []string
 }
 
 // Wrap sets next handler in chain
@@ -144,6 +165,10 @@ func (a *AuthMiddleware) GetUser(r *http.Request) (interface{}, error) {
 		// https://github.com/kubernetes/kubernetes/pull/34524/files#diff-2b283dde198c92424df5355f39544aa4R59
 		return nil, trace.AccessDenied("access denied: intermediaries are not supported")
 	}
+	localClusterName, err := a.AccessPoint.GetDomainName()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 	// with no client authentication in place, middleware
 	// assumes not-privileged Nop role.
 	// it theoretically possible to use bearer token auth even
@@ -151,9 +176,10 @@ func (a *AuthMiddleware) GetUser(r *http.Request) (interface{}, error) {
 	// therefore it is not allowed to reduce scope
 	if len(peers) == 0 {
 		return BuiltinRole{
-			GetClusterConfig: a.AuthServer.getCachedClusterConfig,
+			GetClusterConfig: a.AccessPoint.GetClusterConfig,
 			Role:             teleport.RoleNop,
 			Username:         string(teleport.RoleNop),
+			ClusterName:      localClusterName,
 		}, nil
 	}
 	clientCert := peers[0]
@@ -162,14 +188,22 @@ func (a *AuthMiddleware) GetUser(r *http.Request) (interface{}, error) {
 		log.Warning("Failed to parse client certificate %v.", err)
 		return nil, trace.AccessDenied("access denied: invalid client certificate")
 	}
-	localClusterName, err := a.AuthServer.GetDomainName()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+
 	identity, err := tlsca.FromSubject(clientCert.Subject)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+	// If there is any restriction on the certificate usage
+	// reject the API server request. This is done so some classes
+	// of certificates issued for kubernetes usage by proxy, can not be used
+	// against auth server. Later on we can extend more
+	// advanced cert usage, but for now this is the safest option.
+	if len(identity.Usage) != 0 && !utils.StringSlicesEqual(a.AcceptedUsage, identity.Usage) {
+		log.Warningf("Restricted certificate of user %q with usage %v rejected while accessing the auth endpoint with acceptable usage %v.",
+			identity.Username, identity.Usage, a.AcceptedUsage)
+		return nil, trace.AccessDenied("access denied: invalid client certificate")
+	}
+
 	// this block assumes interactive user from remote cluster
 	// based on the remote certificate authority cluster name encoded in
 	// x509 organization name. This is a safe check because:
@@ -193,6 +227,7 @@ func (a *AuthMiddleware) GetUser(r *http.Request) (interface{}, error) {
 		return RemoteUser{
 			ClusterName: certClusterName,
 			Username:    identity.Username,
+			Principals:  identity.Principals,
 			RemoteRoles: identity.Groups,
 		}, nil
 	}
@@ -204,9 +239,10 @@ func (a *AuthMiddleware) GetUser(r *http.Request) (interface{}, error) {
 	// agent, e.g. Proxy, connecting to the cluster
 	if systemRole != nil {
 		return BuiltinRole{
-			GetClusterConfig: a.AuthServer.getCachedClusterConfig,
+			GetClusterConfig: a.AccessPoint.GetClusterConfig,
 			Role:             *systemRole,
 			Username:         identity.Username,
+			ClusterName:      localClusterName,
 		}, nil
 	}
 	// otherwise assume that is a local role, no need to pass the roles
@@ -242,4 +278,31 @@ func (a *AuthMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// determine authenticated user based on the request parameters
 	requestWithContext := r.WithContext(context.WithValue(baseContext, ContextUser, user))
 	a.Handler.ServeHTTP(w, requestWithContext)
+}
+
+// ClientCertPool returns trusted x509 cerificate authority pool
+func ClientCertPool(client AccessPoint) (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	var authorities []services.CertAuthority
+	hostCAs, err := client.GetCertAuthorities(services.HostCA, false)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	userCAs, err := client.GetCertAuthorities(services.UserCA, false)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	authorities = append(authorities, hostCAs...)
+	authorities = append(authorities, userCAs...)
+
+	for _, auth := range authorities {
+		for _, keyPair := range auth.GetTLSKeyPairs() {
+			cert, err := tlsca.ParseCertificatePEM(keyPair.Cert)
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+			pool.AddCert(cert)
+		}
+	}
+	return pool, nil
 }

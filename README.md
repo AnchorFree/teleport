@@ -32,7 +32,7 @@ implementation and it is _fully compatible with OpenSSH_ and can be used with
 
 ## Installing and Running
 
-Download the [latest binary release](https://github.com/gravitational/teleport/releases), 
+Download the [latest binary release](https://gravitational.com/teleport/download/), 
 unpack the .tar.gz and run `sudo ./install`. This will copy Teleport binaries into 
 `/usr/local/bin`.
 
@@ -44,6 +44,14 @@ $ sudo teleport start
 
 In a production environment Teleport must run as root. But to play, just do `chown $USER /var/lib/teleport` 
 and run it under `$USER`, in this case you will not be able to login as someone else though.
+
+If you wish to deploy Teleport inside a Docker container:
+
+```
+# This command will pull the Teleport container image for version 2.7.3
+# Replace 2.7.3 with the version you need:
+$ docker pull quay.io/gravitational/teleport:2.7.3
+```
 
 ## Building Teleport
 
@@ -117,15 +125,19 @@ You can also reach the Gravitational team through their [website](https://gravit
 ## Is Teleport Secure and Production Ready?
 
 Teleport has completed several security audits from the nationally recognized
-technology security companies. Some of them have been [made public](https://gravitational.com/blog/teleport-release-2-2/). 
+technology security companies. [Some](https://gravitational.com/blog/teleport-release-2-2/) of 
+[them](https://gravitational.com/blog/teleport-security-audit/) have been made public. 
 We are comfortable with the use of Teleport from a security perspective.
+
+You can see the list of companies who use Teleport in production on the Teleport 
+[product page](https://gravitational.com/teleport#customerlist).
 
 However, Teleport is still a relatively young product so you may experience
 usability issues.  We are actively supporting Teleport and addressing any
 issues that are submitted to this repo. Ask questions, send pull requests,
 report issues and don't be shy! :)
 
-The latest stable Teleport build can be found in [Releases](https://github.com/gravitational/teleport/releases)
+The latest stable Teleport build can be found in [Releases](https://gravitational.com/teleport/download/)
 
 ## Known Issues
 
@@ -135,7 +147,7 @@ The latest stable Teleport build can be found in [Releases](https://github.com/g
 
 Teleport was created by [Gravitational Inc](https://gravitational.com). We have
 built Teleport by borrowing from our previous experiences at Rackspace. It has 
-been extracted from [Telekube](https://gravitational.com/product), our
+been extracted from [Telekube](https://gravitational.com/telekube/), our
 Kubernetes distribution optimized for deploying and remotely controlling complex 
 applications into multiple environments _at the same time_:
 

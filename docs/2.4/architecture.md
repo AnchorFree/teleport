@@ -65,7 +65,7 @@ Teleport supports two types of user accounts:
       [Authy](https://www.authy.com/) or any other TOTP client.
     * [U2F](https://en.wikipedia.org/wiki/Universal_2nd_Factor).
 * **External users** are users stored elsewhere else within an organization. Examples include
-  Github, Active Directory (AD), LDAP server, OpenID/OAuth2 endpoint or behind SAML. 
+  Github, Active Directory (AD), OpenID/OAuth2 endpoint or behind SAML. 
 
 
 !!! tip "Version Warning": 
@@ -279,7 +279,7 @@ Teleport Proxy implements a special method to let clients get short lived certif
 1. TSH client or TSH agent generate OpenSSH keypair and forward generated public key and username, password and second factor token that are entered by user to the proxy.
 2. Proxy forwards request to the auth server.
 3. If auth server accepts credentials, it generates a new certificate signed by its user CA and sends it back to the proxy.
-4. Proxy 
+4. Proxy returns the user certificate to the client and client stores it in `~/.tsh/keys`
 
 #### Connecting to the nodes
 
