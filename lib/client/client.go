@@ -34,6 +34,7 @@ import (
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/sshutils/scp"
@@ -51,7 +52,7 @@ type ProxyClient struct {
 	hostLogin       string
 	proxyAddress    string
 	proxyPrincipal  string
-	hostKeyCallback utils.HostKeyCallback
+	hostKeyCallback ssh.HostKeyCallback
 	authMethod      ssh.AuthMethod
 	siteName        string
 	clientAddr      string
@@ -63,6 +64,7 @@ type NodeClient struct {
 	Namespace string
 	Client    *ssh.Client
 	Proxy     *ProxyClient
+	TC        *TeleportClient
 }
 
 // GetSites returns list of the "sites" (AKA teleport clusters) connected to the proxy
@@ -118,10 +120,12 @@ func (proxy *ProxyClient) FindServersByLabels(ctx context.Context, namespace str
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	siteNodes, err := site.GetNodes(namespace)
+
+	siteNodes, err := site.GetNodes(namespace, services.SkipValidation())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	// look at every node on this site and see which ones match:
 	for _, node := range siteNodes {
 		if node.MatchAgainst(labels) {
@@ -166,25 +170,25 @@ func (proxy *ProxyClient) ConnectToSite(ctx context.Context, quiet bool) (auth.C
 		return auth.NewTLSClientWithDialer(dialer, proxy.teleportClient.TLS)
 	}
 
-	tlsConfig := utils.TLSConfig()
+	// Because Teleport clients can't be configured (yet), they take the default
+	// list of cipher suites from Go.
+	tlsConfig := utils.TLSConfig(nil)
 	localAgent := proxy.teleportClient.LocalAgent()
-	pool, err := localAgent.GetCerts(proxy.teleportClient.ProxyHost())
+	pool, err := localAgent.GetCerts()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	tlsConfig.RootCAs = pool
-	keys, err := localAgent.GetKeys(proxy.teleportClient.Username)
+	key, err := localAgent.GetKey()
 	if err != nil {
-		return nil, trace.Wrap(err, "failed to fetch TLS keys for %v", proxy.teleportClient.Username)
+		return nil, trace.Wrap(err, "failed to fetch TLS key for %v", proxy.teleportClient.Username)
 	}
-	for _, key := range keys {
-		if len(key.TLSCert) != 0 {
-			tlsCert, err := tls.X509KeyPair(key.TLSCert, key.Priv)
-			if err != nil {
-				return nil, trace.Wrap(err, "failed to parse TLS cert and key")
-			}
-			tlsConfig.Certificates = append(tlsConfig.Certificates, tlsCert)
+	if len(key.TLSCert) != 0 {
+		tlsCert, err := tls.X509KeyPair(key.TLSCert, key.Priv)
+		if err != nil {
+			return nil, trace.Wrap(err, "failed to parse TLS cert and key")
 		}
+		tlsConfig.Certificates = append(tlsConfig.Certificates, tlsCert)
 	}
 	if len(tlsConfig.Certificates) == 0 {
 		return nil, trace.BadParameter("no TLS keys found for user %v, please relogin to get new credentials", proxy.teleportClient.Username)
@@ -277,7 +281,7 @@ func (proxy *ProxyClient) isRecordingProxy() (bool, error) {
 
 // dialAuthServer returns auth server connection forwarded via proxy
 func (proxy *ProxyClient) dialAuthServer(ctx context.Context, clusterName string) (net.Conn, error) {
-	log.Debugf("client=%v connecting to auth server on cluster ", proxy.clientAddr, clusterName)
+	log.Debugf("Client %v is connecting to auth server on cluster %q.", proxy.clientAddr, clusterName)
 
 	address := "@" + clusterName
 
@@ -422,9 +426,62 @@ func (proxy *ProxyClient) ConnectToNode(ctx context.Context, nodeAddress string,
 		return nil, trace.Wrap(err)
 	}
 
-	client := ssh.NewClient(conn, chans, reqs)
+	// We pass an empty channel which we close right away to ssh.NewClient
+	// because the client need to handle requests itself.
+	emptyCh := make(chan *ssh.Request)
+	close(emptyCh)
 
-	return &NodeClient{Client: client, Proxy: proxy, Namespace: defaults.Namespace}, nil
+	client := ssh.NewClient(conn, chans, emptyCh)
+
+	nc := &NodeClient{
+		Client:    client,
+		Proxy:     proxy,
+		Namespace: defaults.Namespace,
+		TC:        proxy.teleportClient,
+	}
+
+	// Start a goroutine that will run for the duration of the client to process
+	// global requests from the client. Teleport clients will use this to update
+	// terminal sizes when the remote PTY size has changed.
+	go nc.handleGlobalRequests(ctx, reqs)
+
+	return nc, nil
+}
+
+func (c *NodeClient) handleGlobalRequests(ctx context.Context, requestCh <-chan *ssh.Request) {
+	for {
+		select {
+		case r := <-requestCh:
+			// When the channel is closing, nil is returned.
+			if r == nil {
+				return
+			}
+
+			switch r.Type {
+			case teleport.SessionEvent:
+				// Parse event and create events.EventFields that can be consumed directly
+				// by caller.
+				var e events.EventFields
+				err := json.Unmarshal(r.Payload, &e)
+				if err != nil {
+					log.Warnf("Unable to parse event: %v: %v.", string(r.Payload), err)
+					continue
+				}
+
+				// Send event to event channel.
+				err = c.TC.SendEvent(ctx, e)
+				if err != nil {
+					log.Warnf("Unable to send event %v: %v.", string(r.Payload), err)
+					continue
+				}
+			default:
+				// This handles keepalive messages and matches the behaviour of OpenSSH.
+				r.Reply(false, nil)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // newClientConn is a wrapper around ssh.NewClientConn
@@ -467,57 +524,26 @@ func (proxy *ProxyClient) Close() error {
 	return proxy.Client.Close()
 }
 
-// Upload uploads local file(s) or to the remote server's destination path
-func (client *NodeClient) Upload(srcPath, rDestPath string, recursive bool, stderr, progressWriter io.Writer) error {
-	scpConf := scp.Command{
-		Source:    true,
-		Recursive: recursive,
-		Target:    []string{srcPath},
-		Terminal:  progressWriter,
-	}
-
-	// "impersonate" scp to a server
-	shellCmd := "/usr/bin/scp -t"
-	if recursive {
-		shellCmd += " -r"
-	}
-	shellCmd += (" " + rDestPath)
-	return client.scp(scpConf, shellCmd, stderr)
-}
-
-// Download downloads file or dir from the remote server
-func (client *NodeClient) Download(remoteSourcePath, localDestinationPath string, recursive bool, stderr, progressWriter io.Writer) error {
-	scpConf := scp.Command{
-		Sink:      true,
-		Recursive: recursive,
-		Target:    []string{localDestinationPath},
-		Terminal:  progressWriter,
-	}
-
-	// "impersonate" scp to a server
-	shellCmd := "/usr/bin/scp -f"
-	if recursive {
-		shellCmd += " -r"
-	}
-	shellCmd += (" " + remoteSourcePath)
-	return client.scp(scpConf, shellCmd, stderr)
-}
-
-// scp runs remote scp command(shellCmd) on the remote server and
-// runs local scp handler using scpConf
-func (client *NodeClient) scp(scpCommand scp.Command, shellCmd string, errWriter io.Writer) error {
-	session, err := client.Client.NewSession()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	defer session.Close()
-
-	stdin, err := session.StdinPipe()
+// ExecuteSCP runs remote scp command(shellCmd) on the remote server and
+// runs local scp handler using SCP Command
+func (client *NodeClient) ExecuteSCP(cmd scp.Command) error {
+	shellCmd, err := cmd.GetRemoteShellCmd()
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	stdout, err := session.StdoutPipe()
+	s, err := client.Client.NewSession()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	defer s.Close()
+
+	stdin, err := s.StdinPipe()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	stdout, err := s.StdoutPipe()
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -532,18 +558,19 @@ func (client *NodeClient) scp(scpCommand scp.Command, shellCmd string, errWriter
 
 	closeC := make(chan interface{}, 1)
 	go func() {
-		if err = scpCommand.Execute(ch); err != nil {
+		if err = cmd.Execute(ch); err != nil {
 			log.Error(err)
 		}
 		stdin.Close()
 		close(closeC)
 	}()
 
-	runErr := session.Run(shellCmd)
-	if runErr != nil && err == nil {
+	runErr := s.Run(shellCmd)
+	<-closeC
+
+	if runErr != nil && (err == nil || trace.IsEOF(err)) {
 		err = runErr
 	}
-	<-closeC
 	if trace.IsEOF(err) {
 		err = nil
 	}

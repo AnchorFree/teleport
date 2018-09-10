@@ -22,7 +22,7 @@ import (
 	"os"
 
 	"github.com/gravitational/teleport/lib/backend"
-	"github.com/gravitational/teleport/lib/backend/boltbk"
+	"github.com/gravitational/teleport/lib/backend/dir"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
 
@@ -52,7 +52,7 @@ func (s *PresenceSuite) SetUpTest(c *check.C) {
 	s.tempDir, err = ioutil.TempDir("", "trusted-clusters-")
 	c.Assert(err, check.IsNil)
 
-	s.bk, err = boltbk.New(backend.Params{"path": s.tempDir})
+	s.bk, err = dir.New(backend.Params{"path": s.tempDir})
 	c.Assert(err, check.IsNil)
 }
 
@@ -88,9 +88,9 @@ func (s *PresenceSuite) TestTrustedClusterCRUD(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	// create trusted clusters
-	err = presenceBackend.UpsertTrustedCluster(tc)
+	_, err = presenceBackend.UpsertTrustedCluster(tc)
 	c.Assert(err, check.IsNil)
-	err = presenceBackend.UpsertTrustedCluster(stc)
+	_, err = presenceBackend.UpsertTrustedCluster(stc)
 	c.Assert(err, check.IsNil)
 
 	// get trusted cluster make sure it's correct

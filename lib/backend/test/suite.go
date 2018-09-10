@@ -19,15 +19,19 @@ limitations under the License.
 package test
 
 import (
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gravitational/teleport/lib/backend"
+	"github.com/gravitational/teleport/lib/fixtures"
 
 	"github.com/gravitational/trace"
 	. "gopkg.in/check.v1"
 )
+
+var _ = fmt.Printf
 
 func TestBackend(t *testing.T) { TestingT(t) }
 
@@ -109,23 +113,49 @@ func (s *BackendSuite) BasicCRUD(c *C) {
 	c.Assert(s.B.UpsertVal([]string{"a", "c"}, "xkey", []byte("val3"), 0), IsNil)
 	c.Assert(s.B.UpsertVal([]string{"a", "c"}, "ykey", []byte("val4"), 0), IsNil)
 	c.Assert(s.B.DeleteBucket([]string{"a"}, "c"), IsNil)
+	c.Assert(s.B.DeleteBucket([]string{"a"}, "c"), NotNil)
+
 	_, err = s.B.GetVal([]string{"a", "c"}, "xkey")
 	c.Assert(trace.IsNotFound(err), Equals, true, Commentf("%#v", err))
 	_, err = s.B.GetVal([]string{"a", "c"}, "ykey")
 	c.Assert(trace.IsNotFound(err), Equals, true, Commentf("%#v", err))
 }
 
-// BatchCRUD tests batch CRUD operations if supported by the backend
+// CompareAndSwap tests compare and swap functionality
+func (s *BackendSuite) CompareAndSwap(c *C) {
+	bucket := []string{"test", "cas"}
+
+	// compare and swap on non existing operation will fail
+	err := s.B.CompareAndSwapVal(bucket, "one", []byte("1"), []byte("2"), backend.Forever)
+	fixtures.ExpectCompareFailed(c, err)
+
+	err = s.B.CreateVal(bucket, "one", []byte("1"), backend.Forever)
+	c.Assert(err, IsNil)
+
+	// success CAS!
+	err = s.B.CompareAndSwapVal(bucket, "one", []byte("2"), []byte("1"), backend.Forever)
+	c.Assert(err, IsNil)
+
+	val, err := s.B.GetVal(bucket, "one")
+	c.Assert(err, IsNil)
+	c.Assert(string(val), Equals, "2")
+
+	// value has been updated - not '1' any more
+	err = s.B.CompareAndSwapVal(bucket, "one", []byte("3"), []byte("1"), backend.Forever)
+	fixtures.ExpectCompareFailed(c, err)
+
+	// existing value has not been changed by the failed CAS operation
+	val, err = s.B.GetVal(bucket, "one")
+	c.Assert(err, IsNil)
+	c.Assert(string(val), Equals, "2")
+}
+
+// BatchCRUD tests batch CRUD operations.
 func (s *BackendSuite) BatchCRUD(c *C) {
-	getter, ok := s.B.(backend.ItemsGetter)
-	if !ok {
-		c.Skip("backend does not support batch get")
-		return
-	}
 	c.Assert(s.B.UpsertVal([]string{"a", "b"}, "bkey", []byte("val1"), 0), IsNil)
 	c.Assert(s.B.UpsertVal([]string{"a", "b"}, "akey", []byte("val2"), 0), IsNil)
 
-	items, err := getter.GetItems([]string{"a", "b"})
+	items, err := s.B.GetItems([]string{"a", "b"})
 	c.Assert(err, IsNil)
 	c.Assert(len(items), Equals, 2)
 	c.Assert(string(items[0].Value), Equals, "val2")

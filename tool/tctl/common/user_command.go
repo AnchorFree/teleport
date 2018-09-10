@@ -18,8 +18,6 @@ package common
 
 import (
 	"fmt"
-	"net"
-	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +38,7 @@ type UserCommand struct {
 	config        *service.Config
 	login         string
 	allowedLogins string
+	kubeGroups    string
 	roles         string
 	identities    []string
 	ttl           time.Duration
@@ -59,6 +58,8 @@ func (u *UserCommand) Initialize(app *kingpin.Application, config *service.Confi
 	u.userAdd.Arg("account", "Teleport user account name").Required().StringVar(&u.login)
 	u.userAdd.Arg("local-logins", "Local UNIX users this account can log in as [login]").
 		Default("").StringVar(&u.allowedLogins)
+	u.userAdd.Flag("k8s-groups", "Kubernetes groups to assign to a user.").
+		Default("").StringVar(&u.kubeGroups)
 	u.userAdd.Flag("ttl", fmt.Sprintf("Set expiration time for token, default is %v hour, maximum is %v hours",
 		int(defaults.SignupTokenTTL/time.Hour), int(defaults.MaxSignupTokenTTL/time.Hour))).
 		Default(fmt.Sprintf("%v", defaults.SignupTokenTTL)).DurationVar(&u.ttl)
@@ -100,9 +101,14 @@ func (u *UserCommand) Add(client auth.ClientI) error {
 	if u.allowedLogins == "" {
 		u.allowedLogins = u.login
 	}
+	var kubeGroups []string
+	if u.kubeGroups != "" {
+		kubeGroups = strings.Split(u.kubeGroups, ",")
+	}
 	user := services.UserV1{
 		Name:          u.login,
 		AllowedLogins: strings.Split(u.allowedLogins, ","),
+		KubeGroups:    kubeGroups,
 	}
 	token, err := client.CreateSignupToken(user, u.ttl)
 	if err != nil {
@@ -115,23 +121,11 @@ func (u *UserCommand) Add(client auth.ClientI) error {
 }
 
 func (u *UserCommand) PrintSignupURL(client auth.ClientI, token string, ttl time.Duration) {
-	hostname := "your.teleport.proxy"
+	signupURL, proxyHost := web.CreateSignupLink(client, token)
 
-	proxies, err := client.GetProxies()
-	if err == nil {
-		if len(proxies) == 0 {
-			fmt.Printf("\x1b[1mWARNING\x1b[0m: this Teleport cluster does not have any proxy servers online.\nYou need to start some to be able to login.\n\n")
-		} else {
-			hostname = proxies[0].GetHostname()
-		}
-	}
-	_, proxyPort, err := net.SplitHostPort(u.config.Proxy.WebAddr.Addr)
-	if err != nil {
-		proxyPort = strconv.Itoa(defaults.HTTPListenPort)
-	}
-	url := web.CreateSignupLink(net.JoinHostPort(hostname, proxyPort), token)
-	fmt.Printf("Signup token has been created and is valid for %v hours. Share this URL with the user:\n%v\n\nNOTE: make sure '%s' is accessible!\n",
-		int(ttl/time.Hour), url, hostname)
+	fmt.Printf("Signup token has been created and is valid for %v hours. Share this URL with the user:\n%v\n\n",
+		int(ttl/time.Hour), signupURL)
+	fmt.Printf("NOTE: Make sure %v points at a Teleport proxy which users can access.\n", proxyHost)
 }
 
 // Update updates existing user

@@ -21,14 +21,16 @@ package session
 import (
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/defaults"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/docker/docker/pkg/term"
 	"github.com/gravitational/trace"
-	"github.com/moby/moby/pkg/term"
 	"github.com/pborman/uuid"
 )
 
@@ -154,10 +156,33 @@ func (p *Party) String() string {
 	)
 }
 
-// TerminalParams holds parameters of the terminal used in session
+// TerminalParams holds the terminal size in a session.
 type TerminalParams struct {
 	W int `json:"w"`
 	H int `json:"h"`
+}
+
+// UnmarshalTerminalParams takes a serialized string that contains the
+// terminal parameters and returns a *TerminalParams.
+func UnmarshalTerminalParams(s string) (*TerminalParams, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) != 2 {
+		return nil, trace.BadParameter("failed to unmarshal: too many parts")
+	}
+
+	w, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	h, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return &TerminalParams{
+		W: w,
+		H: h,
+	}, nil
 }
 
 // Serialize is a more strict version of String(): it returns a string
@@ -216,24 +241,26 @@ func (u *UpdateRequest) Check() error {
 	return nil
 }
 
-// Due to limitations of the current back-end, Teleport won't return more than 1000 sessions
-// per time window
+// MaxSessionSliceLength is the maximum number of sessions per time window
+// that the backend will return.
 const MaxSessionSliceLength = 1000
 
-// Service is a realtime SSH session service
-// that has information about sessions that are in-flight in the
-// cluster at the moment
+// Service is a realtime SSH session service that has information about
+// sessions that are in-flight in the cluster at the moment.
 type Service interface {
-	// GetSessions returns a list of currently active sessions
-	// with all parties involved
+	// GetSessions returns a list of currently active sessions with all parties
+	// involved.
 	GetSessions(namespace string) ([]Session, error)
-	// GetSession returns a session with it's parties by ID
+
+	// GetSession returns a session with it's parties by ID.
 	GetSession(namespace string, id ID) (*Session, error)
-	// CreateSession creates a new active session and it's parameters
-	// if term is skipped, terminal size won't be recorded
+
+	// CreateSession creates a new active session and it's parameters if term is
+	// skipped, terminal size won't be recorded.
 	CreateSession(sess Session) error
-	// UpdateSession updates certain session parameters (last_active, terminal parameters)
-	// other parameters will not be updated
+
+	// UpdateSession updates certain session parameters (last_active, terminal
+	// parameters) other parameters will not be updated.
 	UpdateSession(req UpdateRequest) error
 }
 
@@ -383,6 +410,37 @@ func (s *server) UpdateSession(req UpdateRequest) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	return nil
+}
+
+// discardSessionServer discards all information about sessions given to it.
+type discardSessionServer struct {
+}
+
+// NewDiscardSessionServer returns a new discarding session server. It's used
+// with the recording proxy so that nodes don't register active sessions to
+// the backend.
+func NewDiscardSessionServer() *discardSessionServer {
+	return &discardSessionServer{}
+}
+
+// GetSessions returns an empty list of sessions.
+func (d *discardSessionServer) GetSessions(namespace string) ([]Session, error) {
+	return []Session{}, nil
+}
+
+// GetSession always returns a zero session.
+func (d *discardSessionServer) GetSession(namespace string, id ID) (*Session, error) {
+	return &Session{}, nil
+}
+
+// CreateSession always returns nil, does nothing.
+func (d *discardSessionServer) CreateSession(sess Session) error {
+	return nil
+}
+
+// UpdateSession always returns nil, does nothing.
+func (d *discardSessionServer) UpdateSession(req UpdateRequest) error {
 	return nil
 }
 

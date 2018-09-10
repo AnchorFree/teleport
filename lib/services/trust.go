@@ -39,6 +39,11 @@ type Trust interface {
 	// UpsertCertAuthority updates or inserts a new certificate authority
 	UpsertCertAuthority(ca CertAuthority) error
 
+	// CompareAndSwapCertAuthority updates the cert authority value
+	// if existing value matches existing parameter,
+	// returns nil if succeeds, trace.CompareFailed otherwise
+	CompareAndSwapCertAuthority(new, existing CertAuthority) error
+
 	// DeleteCertAuthority deletes particular certificate authority
 	DeleteCertAuthority(id CertAuthID) error
 

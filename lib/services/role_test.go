@@ -183,19 +183,19 @@ func (s *RoleSuite) TestRoleParse(c *C) {
 		},
 		{
 			name: "role with no spec still gets defaults",
-			in:   `{"kind": "role", "version": "v3", "metadata": {"name": "name1"}, "spec": {}}`,
+			in:   `{"kind": "role", "version": "v3", "metadata": {"name": "defrole"}, "spec": {}}`,
 			role: RoleV3{
 				Kind:    KindRole,
 				Version: V3,
 				Metadata: Metadata{
-					Name:      "name1",
+					Name:      "defrole",
 					Namespace: defaults.Namespace,
 				},
 				Spec: RoleSpecV3{
 					Options: RoleOptions{
 						CertificateFormat: teleport.CertificateFormatStandard,
 						MaxSessionTTL:     NewDuration(defaults.MaxCertDuration),
-						PortForwarding:    true,
+						PortForwarding:    NewBoolOption(true),
 					},
 					Allow: RoleConditions{
 						NodeLabels: map[string]string{Wildcard: Wildcard},
@@ -218,7 +218,9 @@ func (s *RoleSuite) TestRoleParse(c *C) {
                  "options": {
                    "cert_format": "standard",
                    "max_session_ttl": "20h",
-                   "port_forwarding": true
+                   "port_forwarding": true,
+                   "client_idle_timeout": "17m",
+                   "disconnect_expired_cert": "yes"
                  },
                  "allow": {
                    "node_labels": {"a": "b"},
@@ -248,9 +250,83 @@ func (s *RoleSuite) TestRoleParse(c *C) {
 				},
 				Spec: RoleSpecV3{
 					Options: RoleOptions{
-						CertificateFormat: teleport.CertificateFormatStandard,
-						MaxSessionTTL:     NewDuration(20 * time.Hour),
-						PortForwarding:    true,
+						CertificateFormat:     teleport.CertificateFormatStandard,
+						MaxSessionTTL:         NewDuration(20 * time.Hour),
+						PortForwarding:        NewBoolOption(true),
+						ClientIdleTimeout:     NewDuration(17 * time.Minute),
+						DisconnectExpiredCert: NewBool(true),
+					},
+					Allow: RoleConditions{
+						NodeLabels: map[string]string{"a": "b"},
+						Namespaces: []string{"default"},
+						Rules: []Rule{
+							Rule{
+								Resources: []string{KindRole},
+								Verbs:     []string{VerbRead, VerbList},
+								Where:     "contains(user.spec.traits[\"groups\"], \"prod\")",
+								Actions: []string{
+									"log(\"info\", \"log entry\")",
+								},
+							},
+						},
+					},
+					Deny: RoleConditions{
+						Namespaces: []string{defaults.Namespace},
+						Logins:     []string{"c"},
+					},
+				},
+			},
+			error: nil,
+		},
+		{
+			name: "alternative options forma",
+			in: `{
+		      "kind": "role",
+		      "version": "v3",
+		      "metadata": {"name": "name1"},
+		      "spec": {
+                 "options": {
+                   "cert_format": "standard",
+                   "max_session_ttl": "20h",
+                   "port_forwarding": "yes",
+                   "forward_agent": "yes",
+                   "client_idle_timeout": "never",
+                   "disconnect_expired_cert": "no"
+                 },
+                 "allow": {
+                   "node_labels": {"a": "b"},
+                   "namespaces": ["default"],
+                   "rules": [
+                     {
+                       "resources": ["role"],
+                       "verbs": ["read", "list"],
+                       "where": "contains(user.spec.traits[\"groups\"], \"prod\")",
+                       "actions": [
+                          "log(\"info\", \"log entry\")"
+                       ]
+                     }
+                   ]
+                 },
+                 "deny": {
+                   "logins": ["c"]
+                 }
+		      }
+		    }`,
+			role: RoleV3{
+				Kind:    KindRole,
+				Version: V3,
+				Metadata: Metadata{
+					Name:      "name1",
+					Namespace: defaults.Namespace,
+				},
+				Spec: RoleSpecV3{
+					Options: RoleOptions{
+						CertificateFormat:     teleport.CertificateFormatStandard,
+						ForwardAgent:          NewBool(true),
+						MaxSessionTTL:         NewDuration(20 * time.Hour),
+						PortForwarding:        NewBoolOption(true),
+						ClientIdleTimeout:     NewDuration(0),
+						DisconnectExpiredCert: NewBool(false),
 					},
 					Allow: RoleConditions{
 						NodeLabels: map[string]string{"a": "b"},
@@ -293,7 +369,7 @@ func (s *RoleSuite) TestRoleParse(c *C) {
 
 			role2, err := UnmarshalRole(out)
 			c.Assert(err, IsNil, comment)
-			c.Assert(*role2, DeepEquals, tc.role, comment)
+			fixtures.DeepCompare(c, *role2, tc.role)
 		}
 	}
 }
@@ -849,71 +925,167 @@ func (s *RoleSuite) TestCheckRuleSorting(c *C) {
 }
 
 func (s *RoleSuite) TestApplyTraits(c *C) {
+	type rule struct {
+		inLogins      []string
+		outLogins     []string
+		inLabels      map[string]string
+		outLabels     map[string]string
+		inKubeGroups  []string
+		outKubeGroups []string
+	}
 	var tests = []struct {
-		inTraits  map[string][]string
-		inLogins  []string
-		outLogins []string
+		comment  string
+		inTraits map[string][]string
+		allow    rule
+		deny     rule
 	}{
-		// 0 - substitute in allow rule
+
 		{
-			map[string][]string{
+			comment: "logins substitute in allow rule",
+			inTraits: map[string][]string{
 				"foo": []string{"bar"},
 			},
-			[]string{`{{external.foo}}`, "root"},
-			[]string{"bar", "root"},
+			allow: rule{
+				inLogins:  []string{`{{external.foo}}`, "root"},
+				outLogins: []string{"bar", "root"},
+			},
 		},
-		// 1 - substitute in deny rule
 		{
-			map[string][]string{
+			comment: "logins substitute in deny rule",
+			inTraits: map[string][]string{
 				"foo": []string{"bar"},
 			},
-			[]string{`{{external.foo}}`},
-			[]string{"bar"},
+			deny: rule{
+				inLogins:  []string{`{{external.foo}}`},
+				outLogins: []string{"bar"},
+			},
 		},
-		// 2 - no variable in logins
 		{
-			map[string][]string{
+			comment: "kube group substitute in allow rule",
+			inTraits: map[string][]string{
 				"foo": []string{"bar"},
 			},
-			[]string{"root"},
-			[]string{"root"},
+			allow: rule{
+				inKubeGroups:  []string{`{{external.foo}}`, "root"},
+				outKubeGroups: []string{"bar", "root"},
+			},
 		},
-		// 3 - invalid variable in logins gets passed along
 		{
-			map[string][]string{
+			comment: "kube group substitute in deny rule",
+			inTraits: map[string][]string{
 				"foo": []string{"bar"},
 			},
-			[]string{`external.foo}}`},
-			[]string{`external.foo}}`},
+			deny: rule{
+				inKubeGroups:  []string{`{{external.foo}}`, "root"},
+				outKubeGroups: []string{"bar", "root"},
+			},
 		},
-		// 4 - variable in logins, none in traits
 		{
-			map[string][]string{
+			comment: "no variable in logins",
+			inTraits: map[string][]string{
 				"foo": []string{"bar"},
 			},
-			[]string{`{{internal.bar}}`, "root"},
-			[]string{"root"},
+			allow: rule{
+				inLogins:  []string{"root"},
+				outLogins: []string{"root"},
+			},
 		},
-		// 5 - multiple variables in traits
+
 		{
-			map[string][]string{
+			comment: "invalid variable in logins gets passed along",
+			inTraits: map[string][]string{
+				"foo": []string{"bar"},
+			},
+			allow: rule{
+				inLogins:  []string{`external.foo}}`},
+				outLogins: []string{`external.foo}}`},
+			},
+		},
+		{
+			comment: "variable in logins, none in traits",
+			inTraits: map[string][]string{
+				"foo": []string{"bar"},
+			},
+			allow: rule{
+				inLogins:  []string{`{{internal.bar}}`, "root"},
+				outLogins: []string{"root"},
+			},
+		},
+		{
+			comment: "multiple variables in traits",
+			inTraits: map[string][]string{
 				"logins": []string{"bar", "baz"},
 			},
-			[]string{`{{internal.logins}}`, "root"},
-			[]string{"bar", "baz", "root"},
+			allow: rule{
+				inLogins:  []string{`{{internal.logins}}`, "root"},
+				outLogins: []string{"bar", "baz", "root"},
+			},
 		},
-		// 6 - deduplicate
 		{
-			map[string][]string{
+			comment: "deduplicate",
+			inTraits: map[string][]string{
 				"foo": []string{"bar"},
 			},
-			[]string{`{{external.foo}}`, "bar"},
-			[]string{"bar"},
+			allow: rule{
+				inLogins:  []string{`{{external.foo}}`, "bar"},
+				outLogins: []string{"bar"},
+			},
+		},
+		{
+			comment: "invalid unix login",
+			inTraits: map[string][]string{
+				"foo": []string{"-foo"},
+			},
+			allow: rule{
+				inLogins:  []string{`{{external.foo}}`, "bar"},
+				outLogins: []string{"bar"},
+			},
+		},
+		{
+			comment: "label substitute in allow and deny rule",
+			inTraits: map[string][]string{
+				"foo":   []string{"bar"},
+				"hello": []string{"there"},
+			},
+			allow: rule{
+				inLabels:  map[string]string{`{{external.foo}}`: "{{external.hello}}"},
+				outLabels: map[string]string{`bar`: "there"},
+			},
+			deny: rule{
+				inLabels:  map[string]string{`{{external.hello}}`: "{{external.foo}}"},
+				outLabels: map[string]string{`there`: "bar"},
+			},
+		},
+
+		{
+			comment: "missing node variables are set to empty during substitution",
+			inTraits: map[string][]string{
+				"foo": []string{"bar"},
+			},
+			allow: rule{
+				inLabels: map[string]string{
+					`{{external.foo}}`:     "value",
+					`{{external.missing}}`: "missing",
+					`missing`:              "{{external.missing}}",
+				},
+				outLabels: map[string]string{`bar`: "value", "missing": "", "": "missing"},
+			},
+		},
+
+		{
+			comment: "the first variable value is picked for labels",
+			inTraits: map[string][]string{
+				"foo": []string{"bar", "baz"},
+			},
+			allow: rule{
+				inLabels:  map[string]string{`{{external.foo}}`: "value"},
+				outLabels: map[string]string{`bar`: "value"},
+			},
 		},
 	}
 
 	for i, tt := range tests {
-		comment := Commentf("Test %v", i)
+		comment := Commentf("Test %v %v", i, tt.comment)
 
 		role := &RoleV3{
 			Kind:    KindRole,
@@ -924,12 +1096,26 @@ func (s *RoleSuite) TestApplyTraits(c *C) {
 			},
 			Spec: RoleSpecV3{
 				Allow: RoleConditions{
-					Logins: tt.inLogins,
+					Logins:     tt.allow.inLogins,
+					NodeLabels: tt.allow.inLabels,
+					KubeGroups: tt.allow.inKubeGroups,
+				},
+				Deny: RoleConditions{
+					Logins:     tt.deny.inLogins,
+					NodeLabels: tt.deny.inLabels,
+					KubeGroups: tt.deny.inKubeGroups,
 				},
 			},
 		}
+
 		outRole := role.ApplyTraits(tt.inTraits)
-		c.Assert(outRole.GetLogins(Allow), DeepEquals, tt.outLogins, comment)
+		c.Assert(outRole.GetLogins(Allow), DeepEquals, tt.allow.outLogins, comment)
+		c.Assert(outRole.GetNodeLabels(Allow), DeepEquals, tt.allow.outLabels, comment)
+		c.Assert(outRole.GetKubeGroups(Allow), DeepEquals, tt.allow.outKubeGroups, comment)
+
+		c.Assert(outRole.GetLogins(Deny), DeepEquals, tt.deny.outLogins, comment)
+		c.Assert(outRole.GetNodeLabels(Deny), DeepEquals, tt.deny.outLabels, comment)
+		c.Assert(outRole.GetKubeGroups(Deny), DeepEquals, tt.deny.outKubeGroups, comment)
 	}
 }
 
@@ -951,6 +1137,11 @@ func (s *RoleSuite) TestCheckAndSetDefaults(c *C) {
 		// 2 - valid syntax
 		{
 			[]string{"{{foo.bar}}"},
+			false,
+		},
+		// 3 - valid syntax
+		{
+			[]string{`{{external["http://schemas.microsoft.com/ws/2008/06/identity/claims/windowsaccountname"]}}`},
 			false,
 		},
 	}

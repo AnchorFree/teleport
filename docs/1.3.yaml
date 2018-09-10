@@ -1,5 +1,5 @@
 site_name: Gravitational Teleport
-site_url: https://gravitational.com/teleport
+site_url: https://gravitational.com/teleport/docs
 repo_url: https://github.com/gravitational/teleport
 site_description: SSH infrastructure for clusters and teams
 site_author: Gravitational Inc
@@ -21,8 +21,9 @@ extra_javascript: []
 extra:    
     version: 1.3           
 pages:
-    - QuickStart Guide: quickstart.md
-    - Architecture: architecture.md
-    - User Manual: user-manual.md
-    - Admin Manual: admin-guide.md
-    - FAQ: faq.md
+    - Documentation:
+        - QuickStart Guide: quickstart.md
+        - Architecture: architecture.md
+        - User Manual: user-manual.md
+        - Admin Manual: admin-guide.md
+        - FAQ: faq.md

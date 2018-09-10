@@ -17,9 +17,11 @@ limitations under the License.
 package client
 
 import (
-	"github.com/gravitational/teleport/lib/utils"
-	"gopkg.in/check.v1"
 	"testing"
+
+	"github.com/gravitational/teleport/lib/utils"
+
+	"gopkg.in/check.v1"
 )
 
 // register test suite
@@ -54,6 +56,11 @@ func (s *APITestSuite) TestConfig(c *check.C) {
 	conf.ProxyHostPort = "example.org:,200"
 	c.Assert(conf.ProxySSHHostPort(), check.Equals, "example.org:200")
 	c.Assert(conf.ProxyWebHostPort(), check.Equals, "example.org:3080")
+
+	conf.SetProxy("example.org", 100, 200)
+	c.Assert(conf.ProxyWebHostPort(), check.Equals, "example.org:100")
+	c.Assert(conf.ProxySSHHostPort(), check.Equals, "example.org:200")
+
 }
 
 func (s *APITestSuite) TestNew(c *check.C) {
@@ -97,23 +104,6 @@ func (s *APITestSuite) TestParseLabels(c *check.C) {
 	m, err = ParseLabelSpec(`type="database",role,master`)
 	c.Assert(m, check.IsNil)
 	c.Assert(err, check.NotNil)
-}
-
-func (s *APITestSuite) TestSCPParsing(c *check.C) {
-	user, host, dest := parseSCPDestination("root@remote.host:/etc/nginx.conf")
-	c.Assert(user, check.Equals, "root")
-	c.Assert(host, check.Equals, "remote.host")
-	c.Assert(dest, check.Equals, "/etc/nginx.conf")
-
-	user, host, dest = parseSCPDestination("remote.host:/etc/nginx.co:nf")
-	c.Assert(user, check.Equals, "")
-	c.Assert(host, check.Equals, "remote.host")
-	c.Assert(dest, check.Equals, "/etc/nginx.co:nf")
-
-	user, host, dest = parseSCPDestination("remote.host:")
-	c.Assert(user, check.Equals, "")
-	c.Assert(host, check.Equals, "remote.host")
-	c.Assert(dest, check.Equals, ".")
 }
 
 func (s *APITestSuite) TestPortsParsing(c *check.C) {

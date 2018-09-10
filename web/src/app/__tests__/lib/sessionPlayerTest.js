@@ -13,141 +13,114 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+import api from 'app/services/api';
+import $ from 'jQuery';
+import expect, { spyOn } from 'expect';
+import { EventProvider, TtyPlayer, MAX_SIZE, Buffer } from 'app/lib/term/ttyPlayer';
+import { TermEventEnum } from 'app/lib/term/enums';
+import sample from './streamData';
 
-var { expect, $, spyOn, api, Dfd } = require('./..');
-var {EventProvider, TtyPlayer, Buffer} = require('app/lib/term/ttyPlayer');
-var sample = require('./streamData')
+const Dfd = $.Deferred;
 
-describe('lib/term/ttyPlayer/eventProvider', function(){
+describe('lib/term/ttyPlayer/eventProvider', () => {
 
   afterEach(function () {
     expect.restoreSpies();
   });
 
-  describe('new()', function(){
-    it('should create an instance', function () {
-      var provider = new EventProvider({url: 'sample.com'});
-      expect(provider.events).toEqual([]);      
+  describe('new()', () => {
+    it('should create an instance', () => {
+      const provider = new EventProvider({url: 'sample.com'});
+      expect(provider.events).toEqual([]);
     });
   });
 
-  describe('init()', function(){
+  describe('init()', () => {
     it('should load events and initialize itself', function () {
-      var provider = new EventProvider({url: 'sample.com'});
+      const provider = new EventProvider({url: 'sample.com'});
       spyOn(api, 'get').andReturn(Dfd().resolve(sample))
-      spyOn(provider, '_createPrintEvents');
-      spyOn(provider, '_normalizeEventsByTime');
+      spyOn(provider, '_createEvents').andCallThrough();
+      spyOn(provider, '_normalizeEventsByTime').andCallThrough();
+      spyOn(provider, '_fetchContent').andReturn(Dfd().resolve());
+      spyOn(provider, '_populatePrintEvents');
 
       provider.init();
-
       expect(api.get).toHaveBeenCalledWith('sample.com/events');
-      expect(provider._createPrintEvents).toHaveBeenCalledWith(sample.events);
+      expect(provider._createEvents).toHaveBeenCalledWith(sample.events);
       expect(provider._normalizeEventsByTime).toHaveBeenCalled();
+      expect(provider._fetchContent).toHaveBeenCalled();
+      expect(provider._populatePrintEvents).toHaveBeenCalled();
     });
   });
 
-  describe('_createPrintEvents()', function(){
-    it('should filter json data for print events and create event objects', function () {
-      var provider = new EventProvider({url: 'sample.com'});
-      var eventObj = {
-        displayTime: "00:45",
-        ms: 4524,
-        msNormalized: 4524,
-        bytes: 183,
-        offset: 144056,
+  describe('_createEvents()', () => {
+    it('should create event objects', () => {
+      const provider = new EventProvider({ url: 'sample.com' });
+      const events = provider._createEvents(sample.events);
+      const eventObj = {
+        eventType: 'print',
+        displayTime: '00:45',
+        ms: 4523,
+        bytes: 6516,
+        offset: 137723,
         data: null,
         w: 115,
         h: 23,
-        time: new Date("2016-05-09T14:57:51.243Z")
+        time: new Date("2016-05-09T14:57:51.238Z"),
+        msNormalized: 1744,
       };
 
-      const events = provider._createPrintEvents(sample.events);
-      expect(events.length).toBe(101);
-      expect(events[100]).toEqual(eventObj);
+      expect(events.length).toBe(32);
+      expect(events[30]).toEqual(eventObj);
     });
   });
 
-  describe('_normalizeEventsByTime()', function(){
-    it('should adjust time for a better replay by shortening delays between events', function () {
+
+  describe('fetchContent()', () => {
+    it('should fetch session content', () => {
       const provider = new EventProvider({url: 'sample.com'});
-      let events = provider._createPrintEvents(sample.events);
-      events = provider._normalizeEventsByTime(events);
-
-      expect(events.length).toBe(31);
-      expect(events[30].msNormalized).toBe(1780);
-    });
-  });
-
-  describe('hasAll(start, end)', function () {
-    it('should check if events exist within given interval', function () {
-      var provider = new EventProvider({url: 'sample.com'});
-      spyOn(api, 'get').andReturn(Dfd().resolve(sample))
-      provider.init();
-      expect(provider.hasAll(0, 3)).toBe(false);
-    });
-  })
-
-  describe('fetchEvents(start, end)', function(){    
-    it('should fetch data stream with the right URL', function () {
-      spyOn(api, 'ajax').andReturn(Dfd());
-      spyOn(api, 'get').andReturn(Dfd().resolve(sample))
-
-      var provider = new EventProvider({url: 'sample.com'});
-      var expected = {
+      const expectedReq = {
         dataType: 'text',
         processData: true,
-        url: 'sample.com/stream?offset=0&bytes=144239'
+        url: `sample.com/stream?offset=0&bytes=${MAX_SIZE}`
       }
 
-      provider.init();
-      provider.fetchEvents(0, 1);
-
-      expect(api.ajax).toHaveBeenCalledWith(expected);
-    });
-
-    it('should be able to fetch and then procces the byte stream', function () {      
-      const provider = new EventProvider({url: 'sample.com'});
-      const events = provider._createPrintEvents(sample.events);
-      
-      provider.events = provider._normalizeEventsByTime(events);
+      spyOn(provider, '_fetchEvents').andReturn(Dfd().resolve(provider._createEvents(sample.events)));
       spyOn(api, 'ajax').andReturn(Dfd().resolve(sample.data))
+      provider.init();
+      expect(api.ajax).toHaveBeenCalledWith(expectedReq);
 
-      const {bytes, offset} = provider.events[10];
       const buf = new Buffer(sample.data);
-      const expected = buf.slice(0, offset + bytes).toString('utf8');
-
-      let actual = null;
-      provider.fetchEvents(0, 11).done(events=>{
-        actual = events.map(ev => ev.data).join('');
-      });
-
-      expect(actual).toEqual(expected);
-
+      const lastEvent = provider.events[provider.events.length-2];
+      const expectedChunk = buf.slice(
+        lastEvent.offset,
+        lastEvent.offset + lastEvent.bytes).toString('utf8');
+      expect(lastEvent.data).toEqual(expectedChunk);
     });
   });
 });
 
-describe('lib/ttyPlayer', function () {
+describe('lib/ttyPlayer', () => {
 
-  afterEach(function () {
+  afterEach(() => {
     expect.restoreSpies();
   });
 
-  describe('new()', function () {
-    it('should create an instance', function () {
-      var ttyPlayer = new TtyPlayer({url: 'testSid'});
+  describe('new()', () => {
+    it('should create an instance', () => {
+      const ttyPlayer = new TtyPlayer({url: 'testSid'});
       expect(ttyPlayer.isReady).toBe(false);
       expect(ttyPlayer.isPlaying).toBe(false);
       expect(ttyPlayer.isError).toBe(false);
       expect(ttyPlayer.isLoading).toBe(true);
-      expect(ttyPlayer.length).toBe(-1);
+      expect(ttyPlayer.duration).toBe(0);
       expect(ttyPlayer.current).toBe(0);
     });
   });
 
-  describe('connect()', function () {
-    it('should initialize event provider', function (cb) {
-      var ttyPlayer = new TtyPlayer({url: 'testSid'});
+  describe('connect()', () => {
+    it('should initialize event provider', cb => {
+      const ttyPlayer = new TtyPlayer({url: 'testSid'});
       spyOn(ttyPlayer._eventProvider, 'init').andReturn(Dfd().resolve(sample));
       ttyPlayer.on('change', cb);
       ttyPlayer.connect();
@@ -155,25 +128,25 @@ describe('lib/ttyPlayer', function () {
       expect(ttyPlayer.length).toBe(sample.events.length);
     });
 
-    it('should indicate its loading status', function (cb) {
+    it('should indicate its loading status', cb => {
       spyOn(api, 'get').andReturn($.Deferred());
-      var ttyPlayer = new TtyPlayer({url: 'testSid'});
+      const ttyPlayer = new TtyPlayer({url: 'testSid'});
       ttyPlayer.on('change', cb);
       ttyPlayer.connect();
       expect(ttyPlayer.isLoading).toBe(true);
     });
 
-    it('should indicate its error status', function (cb) {      
+    it('should indicate its error status', cb => {
       spyOn(api, 'get').andReturn($.Deferred().reject(new Error('!!!')));
-      var ttyPlayer = new TtyPlayer({url: 'testSid'});
+      const ttyPlayer = new TtyPlayer({url: 'testSid'});
       ttyPlayer.on('change', cb);
-      ttyPlayer.connect();      
+      ttyPlayer.connect();
       expect(ttyPlayer.isError).toBe(true);
     });
 
   });
 
-  describe('move()', function () {
+  describe('move()', () => {
     var tty = null;
 
     beforeEach(()=>{
@@ -184,8 +157,8 @@ describe('lib/ttyPlayer', function () {
       tty.isReady = true;
     });
 
-    it('should move by 1 position when called w/o params', function (cb) {
-      tty.on('data', data=>{
+    it('should move by 1 position when called w/o params', cb => {
+      tty.on(TermEventEnum.DATA, data=>{
         expect(data.length).toBe(42);
         cb();
       });
@@ -193,8 +166,8 @@ describe('lib/ttyPlayer', function () {
       tty.move();
     });
 
-    it('should move from 1 to 478 position (forward)', function (cb) {
-      tty.on('data', data=>{
+    it('should move from 1 to 478 position (forward)', cb => {
+      tty.on(TermEventEnum.DATA, data=>{
         cb();
         expect(data.length).toBe(11246);
       });
@@ -202,9 +175,9 @@ describe('lib/ttyPlayer', function () {
       tty.move(478);
     });
 
-    it('should move from 478 to 1 position (back)', function (cb) {
+    it('should move from 478 to 1 position (back)', cb => {
       tty.current = 478;
-      tty.on('data', data=>{
+      tty.on(TermEventEnum.DATA, data=>{
         cb();
         expect(data.length).toEqual(42);
       });
@@ -212,8 +185,8 @@ describe('lib/ttyPlayer', function () {
       tty.move(2);
     });
 
-    it('should stop playing if new position is greater than session length', function (cb) {
-      let someBigNumber = 1000;
+    it('should stop playing if new position is greater than session length', cb => {
+      const someBigNumber = 1000;
       tty.on('change', cb);
       tty.move(someBigNumber);
       expect(tty.isPlaying).toBe(false);
@@ -221,4 +194,3 @@ describe('lib/ttyPlayer', function () {
     });
   });
 })
-

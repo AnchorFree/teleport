@@ -111,7 +111,7 @@ Flags:
       --advertise-ip     IP to advertise to clients if running behind NAT
   -l, --listen-ip        IP address to bind to [0.0.0.0]
       --auth-server      Address of the auth server [127.0.0.1:3025]
-      --token            One-time token to register with an auth server [none]
+      --token            Invitation token to join a cluster [none]
       --nodename         Name of this node, defaults to hostname
   -c, --config           Path to a configuration file [/etc/teleport.yaml]
       --labels           List of labels for this node
@@ -173,7 +173,7 @@ teleport:
     # authentication (if using the default BoltDB back-end)
     data_dir: /var/lib/teleport
 
-    # one-time invitation token used to join a cluster. it is not used on 
+    # Invitation token used to join a cluster. it is not used on 
     # subsequent starts
     auth_token: xxxx-token-xxxx
 
@@ -706,11 +706,6 @@ session.leave   | A user has left the session.
 exec            | Remote command has been executed via SSH, like `tsh ssh root@node ls /`. The following fields will be logged: `{"command": "ls /", "exitCode": 0, "exitError": ""}`
 scp             | Remote file copy has been executed. The following fields will be logged: `{"path": "/path/to/file.txt", "len": 32344, "action": "read" }`
 resize          | Terminal has been resized.
-
-!!! tip "Note":
-    The commercial Teleport edition called "Teleport Enterprise" supports native
-    audit log exporting into external systems like Splunk, AlertLogic and others.
-    Take a look at [Teleport Enterprise](enterprise.md) section to learn more.
 
 ### Recorded Sessions
 

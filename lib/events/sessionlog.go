@@ -17,8 +17,12 @@ limitations under the License.
 package events
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -31,7 +35,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// SessionLogger is an interface that all session loggers must implement.
+// sessionLogger is an interface that all session loggers must implement.
 type SessionLogger interface {
 	// LogEvent logs events associated with this session.
 	LogEvent(fields EventFields) error
@@ -45,10 +49,8 @@ type SessionLogger interface {
 	// releasing audit resources associated with the session
 	Finalize() error
 
-	// WriteChunk takes a stream of bytes (usually the output from a session
-	// terminal) and writes it into a "stream file", for future replay of
-	// interactive sessions.
-	WriteChunk(chunk *SessionChunk) (written int, err error)
+	// PostSessionSlice posts session slice
+	PostSessionSlice(slice SessionSlice) error
 }
 
 // DiskSessionLoggerConfig sets up parameters for disk session logger
@@ -62,15 +64,26 @@ type DiskSessionLoggerConfig struct {
 	Clock clockwork.Clock
 	// RecordSessions controls if sessions are recorded along with audit events.
 	RecordSessions bool
-	// AuditLog is the audit log
-	AuditLog *AuditLog
+	// Namespace is logger namespace
+	Namespace string
+	// ServerID is a server ID
+	ServerID string
+}
+
+func (cfg *DiskSessionLoggerConfig) CheckAndSetDefaults() error {
+	return nil
 }
 
 // NewDiskSessionLogger creates new disk based session logger
 func NewDiskSessionLogger(cfg DiskSessionLoggerConfig) (*DiskSessionLogger, error) {
+	if err := cfg.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
 	var err error
 
-	indexFile, err := os.OpenFile(filepath.Join(cfg.DataDir, fmt.Sprintf("%v.index", cfg.SessionID.String())), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+	sessionDir := filepath.Join(cfg.DataDir, cfg.ServerID, SessionLogsDir, cfg.Namespace)
+	indexFile, err := os.OpenFile(
+		filepath.Join(sessionDir, fmt.Sprintf("%v.index", cfg.SessionID.String())), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -83,6 +96,7 @@ func NewDiskSessionLogger(cfg DiskSessionLoggerConfig) (*DiskSessionLogger, erro
 				"sid": cfg.SessionID,
 			},
 		}),
+		sessionDir:     sessionDir,
 		indexFile:      indexFile,
 		lastEventIndex: -1,
 		lastChunkIndex: -1,
@@ -100,30 +114,46 @@ type DiskSessionLogger struct {
 
 	sync.Mutex
 
-	sid session.ID
+	sid        session.ID
+	sessionDir string
 
 	indexFile  *os.File
-	eventsFile *os.File
-	chunksFile *os.File
+	eventsFile *gzipWriter
+	chunksFile *gzipWriter
 
 	lastEventIndex int64
 	lastChunkIndex int64
-
-	// recordSessions controls if sessions are recorded along with audit events.
-	recordSessions bool
 }
 
 // LogEvent logs an event associated with this session
 func (sl *DiskSessionLogger) LogEvent(fields EventFields) error {
-	panic("does  not work")
+	panic("should not be used")
 }
 
 // Close is called when clients close on the requested "session writer".
 // We ignore their requests because this writer (file) should be closed only
 // when the session logger is closed
 func (sl *DiskSessionLogger) Close() error {
-	sl.Debugf("Close")
 	return nil
+}
+
+func openFileForTar(filename string) (*tar.Header, io.ReadCloser, error) {
+	fi, err := os.Stat(filename)
+	if err != nil {
+		return nil, nil, trace.ConvertSystemError(err)
+	}
+
+	header, err := tar.FileInfoHeader(fi, "")
+	if err != nil {
+		return nil, nil, trace.ConvertSystemError(err)
+	}
+
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, nil, trace.ConvertSystemError(err)
+	}
+
+	return header, f, nil
 }
 
 // Finalize is called by the session when it's closing. This is where we're
@@ -135,7 +165,22 @@ func (sl *DiskSessionLogger) Finalize() error {
 	return sl.finalize()
 }
 
+// flush is used to flush gzip frames to file, otherwise
+// some attempts to read the file could fail
+func (sl *DiskSessionLogger) flush() error {
+	var err, err2 error
+
+	if sl.RecordSessions && sl.chunksFile != nil {
+		err = sl.chunksFile.Flush()
+	}
+	if sl.eventsFile != nil {
+		err2 = sl.eventsFile.Flush()
+	}
+	return trace.NewAggregate(err, err2)
+}
+
 func (sl *DiskSessionLogger) finalize() error {
+
 	auditOpenFiles.Dec()
 
 	if sl.indexFile != nil {
@@ -143,11 +188,22 @@ func (sl *DiskSessionLogger) finalize() error {
 	}
 
 	if sl.chunksFile != nil {
-		sl.chunksFile.Close()
+		if err := sl.chunksFile.Close(); err != nil {
+			log.Warningf("Failed closing chunks file: %v.", err)
+		}
 	}
 
 	if sl.eventsFile != nil {
-		sl.eventsFile.Close()
+		if err := sl.eventsFile.Close(); err != nil {
+			log.Warningf("Failed closing events file: %v.", err)
+		}
+	}
+
+	// create a sentinel to signal completion
+	signalFile := filepath.Join(sl.sessionDir, fmt.Sprintf("%v.completed", sl.SessionID.String()))
+	err := ioutil.WriteFile(signalFile, []byte("completed"), 0640)
+	if err != nil {
+		log.Warningf("Failed creating signal file: %v.", err)
 	}
 
 	return nil
@@ -155,12 +211,12 @@ func (sl *DiskSessionLogger) finalize() error {
 
 // eventsFileName consists of session id and the first global event index recorded there
 func eventsFileName(dataDir string, sessionID session.ID, eventIndex int64) string {
-	return filepath.Join(dataDir, fmt.Sprintf("%v-%v.events", sessionID.String(), eventIndex))
+	return filepath.Join(dataDir, fmt.Sprintf("%v-%v.events.gz", sessionID.String(), eventIndex))
 }
 
 // chunksFileName consists of session id and the first global offset recorded
 func chunksFileName(dataDir string, sessionID session.ID, offset int64) string {
-	return filepath.Join(dataDir, fmt.Sprintf("%v-%v.chunks", sessionID.String(), offset))
+	return filepath.Join(dataDir, fmt.Sprintf("%v-%v.chunks.gz", sessionID.String(), offset))
 }
 
 func (sl *DiskSessionLogger) openEventsFile(eventIndex int64) error {
@@ -170,9 +226,9 @@ func (sl *DiskSessionLogger) openEventsFile(eventIndex int64) error {
 			sl.Warningf("Failed to close file: %v", trace.DebugReport(err))
 		}
 	}
-	eventsFileName := eventsFileName(sl.DataDir, sl.SessionID, eventIndex)
+	eventsFileName := eventsFileName(sl.sessionDir, sl.SessionID, eventIndex)
 
-	// udpate the index file to write down that new events file has been created
+	// update the index file to write down that new events file has been created
 	data, err := json.Marshal(indexEntry{
 		FileName: filepath.Base(eventsFileName),
 		Type:     fileTypeEvents,
@@ -188,10 +244,11 @@ func (sl *DiskSessionLogger) openEventsFile(eventIndex int64) error {
 	}
 
 	// open new events file for writing
-	sl.eventsFile, err = os.OpenFile(eventsFileName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+	file, err := os.OpenFile(eventsFileName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	sl.eventsFile = newGzipWriter(file)
 	return nil
 }
 
@@ -202,7 +259,7 @@ func (sl *DiskSessionLogger) openChunksFile(offset int64) error {
 			sl.Warningf("Failed to close file: %v", trace.DebugReport(err))
 		}
 	}
-	chunksFileName := chunksFileName(sl.DataDir, sl.SessionID, offset)
+	chunksFileName := chunksFileName(sl.sessionDir, sl.SessionID, offset)
 
 	// udpate the index file to write down that new chunks file has been created
 	data, err := json.Marshal(indexEntry{
@@ -220,18 +277,45 @@ func (sl *DiskSessionLogger) openChunksFile(offset int64) error {
 	}
 
 	// open new chunks file for writing
-	sl.chunksFile, err = os.OpenFile(chunksFileName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+	file, err := os.OpenFile(chunksFileName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	sl.chunksFile = newGzipWriter(file)
 	return nil
 }
 
-// WriteChunk takes a stream of bytes (usually the output from a session terminal)
-// and writes it into a "stream file", for future replay of interactive sessions.
-func (sl *DiskSessionLogger) WriteChunk(chunk *SessionChunk) (written int, err error) {
+// PostSessionSlice takes series of events associated with the session
+// and writes them to events files and data file for future replays
+func (sl *DiskSessionLogger) PostSessionSlice(slice SessionSlice) error {
 	sl.Lock()
 	defer sl.Unlock()
+
+	for i := range slice.Chunks {
+		_, err := sl.writeChunk(slice.SessionID, slice.Chunks[i])
+		if err != nil {
+			return trace.Wrap(err)
+		}
+	}
+	return sl.flush()
+}
+
+// EventFromChunk retuns event converted from session chunk
+func EventFromChunk(sessionID string, chunk *SessionChunk) (EventFields, error) {
+	var fields EventFields
+	eventStart := time.Unix(0, chunk.Time).In(time.UTC).Round(time.Millisecond)
+	err := json.Unmarshal(chunk.Data, &fields)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	fields[SessionEventID] = sessionID
+	fields[EventIndex] = chunk.EventIndex
+	fields[EventTime] = eventStart
+	fields[EventType] = chunk.EventType
+	return fields, nil
+}
+
+func (sl *DiskSessionLogger) writeChunk(sessionID string, chunk *SessionChunk) (written int, err error) {
 
 	// this section enforces the following invariant:
 	// a single events file only contains successive events
@@ -241,32 +325,21 @@ func (sl *DiskSessionLogger) WriteChunk(chunk *SessionChunk) (written int, err e
 		}
 	}
 	sl.lastEventIndex = chunk.EventIndex
-
+	eventStart := time.Unix(0, chunk.Time).In(time.UTC).Round(time.Millisecond)
 	if chunk.EventType != SessionPrintEvent {
-		if chunk.EventType == SessionEndEvent {
-			defer sl.closeLogger()
-		}
-		var fields EventFields
-		err := json.Unmarshal(chunk.Data, &fields)
+		fields, err := EventFromChunk(sessionID, chunk)
 		if err != nil {
 			return -1, trace.Wrap(err)
 		}
-		fields[EventIndex] = chunk.EventIndex
-		fields[EventTime] = sl.Clock.Now().In(time.UTC).Round(time.Millisecond)
-		fields[EventType] = chunk.EventType
 		data, err := json.Marshal(fields)
 		if err != nil {
 			return -1, trace.Wrap(err)
 		}
-		if err := sl.AuditLog.emitAuditEvent(chunk.EventType, fields); err != nil {
-			return -1, trace.Wrap(err)
-		}
-		return fmt.Fprintln(sl.eventsFile, string(data))
+		return sl.eventsFile.Write(append(data, '\n'))
 	}
 	if !sl.RecordSessions {
 		return len(chunk.Data), nil
 	}
-	eventStart := time.Unix(0, chunk.Time).In(time.UTC).Round(time.Millisecond)
 	// this section enforces the following invariant:
 	// a single chunks file only contains successive chunks
 	if sl.lastChunkIndex == -1 || chunk.ChunkIndex-1 != sl.lastChunkIndex {
@@ -288,18 +361,11 @@ func (sl *DiskSessionLogger) WriteChunk(chunk *SessionChunk) (written int, err e
 	if err != nil {
 		return -1, trace.Wrap(err)
 	}
-	_, err = fmt.Fprintln(sl.eventsFile, string(bytes))
+	_, err = sl.eventsFile.Write(append(bytes, '\n'))
 	if err != nil {
 		return -1, trace.Wrap(err)
 	}
 	return sl.chunksFile.Write(chunk.Data)
-}
-
-func (sl *DiskSessionLogger) closeLogger() {
-	sl.AuditLog.removeLogger(sl.SessionID.String())
-	if err := sl.finalize(); err != nil {
-		log.Error(err)
-	}
 }
 
 func diff(before, after time.Time) int64 {
@@ -338,4 +404,77 @@ type printEvent struct {
 	EventIndex int64 `json:"ei"`
 	// ChunkIndex is the global chunk index
 	ChunkIndex int64 `json:"ci"`
+}
+
+// gzipWriter wraps file, on close close both gzip writer and file
+type gzipWriter struct {
+	*gzip.Writer
+	file *os.File
+}
+
+// Close closes gzip writer and file
+func (f *gzipWriter) Close() error {
+	var errors []error
+	if f.Writer != nil {
+		errors = append(errors, f.Writer.Close())
+		f.Writer.Reset(ioutil.Discard)
+		writerPool.Put(f.Writer)
+		f.Writer = nil
+	}
+	if f.file != nil {
+		errors = append(errors, f.file.Close())
+		f.file = nil
+	}
+	return trace.NewAggregate(errors...)
+}
+
+// writerPool is a sync.Pool for shared gzip writers.
+// each gzip writer allocates a lot of memory
+// so it makes sense to reset the writer and reuse the
+// internal buffers to avoid too many objects on the heap
+var writerPool = sync.Pool{
+	New: func() interface{} {
+		w, _ := gzip.NewWriterLevel(ioutil.Discard, gzip.BestSpeed)
+		return w
+	},
+}
+
+func newGzipWriter(file *os.File) *gzipWriter {
+	g := writerPool.Get().(*gzip.Writer)
+	g.Reset(file)
+	return &gzipWriter{
+		Writer: g,
+		file:   file,
+	}
+}
+
+// gzipReader wraps file, on close close both gzip writer and file
+type gzipReader struct {
+	io.ReadCloser
+	file io.Closer
+}
+
+// Close closes file and gzip writer
+func (f *gzipReader) Close() error {
+	var errors []error
+	if f.ReadCloser != nil {
+		errors = append(errors, f.ReadCloser.Close())
+		f.ReadCloser = nil
+	}
+	if f.file != nil {
+		errors = append(errors, f.file.Close())
+		f.file = nil
+	}
+	return trace.NewAggregate(errors...)
+}
+
+func newGzipReader(file *os.File) (*gzipReader, error) {
+	reader, err := gzip.NewReader(file)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &gzipReader{
+		ReadCloser: reader,
+		file:       file,
+	}, nil
 }

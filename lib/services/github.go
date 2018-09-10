@@ -51,7 +51,8 @@ type GithubConnector interface {
 	// SetTeamsToLogins sets the mapping of Github teams to allowed logins
 	SetTeamsToLogins([]TeamMapping)
 	// MapClaims returns the list of allows logins based on the retrieved claims
-	MapClaims(GithubClaims) []string
+	// returns list of logins and kubernetes groups
+	MapClaims(GithubClaims) ([]string, []string)
 	// GetDisplay returns the connector display name
 	GetDisplay() string
 	// SetDisplay sets the connector display name
@@ -106,7 +107,9 @@ type TeamMapping struct {
 	// Team is a team within the organization a user belongs to
 	Team string `json:"team"`
 	// Logins is a list of allowed logins for this org/team
-	Logins []string `json:"logins"`
+	Logins []string `json:"logins,omitempty"`
+	// KubeGroups is a list of allowed kubernetes groups for this org/team
+	KubeGroups []string `json:"kubernetes_groups,omitempty"`
 }
 
 // GithubClaims represents Github user information obtained during OAuth2 flow
@@ -205,12 +208,10 @@ func (c *GithubConnectorV3) SetDisplay(display string) {
 	c.Spec.Display = display
 }
 
-// MapClaims returns a list of logins based on the provided claims
-func (c *GithubConnectorV3) MapClaims(claims GithubClaims) []string {
-	var logins []string
-	if localLogin, ok := c.Spec.UsersMap[claims.Username]; ok {
-		logins = append(logins, localLogin)
-	}
+// MapClaims returns a list of logins based on the provided claims,
+// returns a list of logins and list of kubernetes groups
+func (c *GithubConnectorV3) MapClaims(claims GithubClaims) ([]string, []string) {
+	var logins, kubeGroups []string
 	for _, mapping := range c.GetTeamsToLogins() {
 		teams, ok := claims.OrganizationToTeams[mapping.Organization]
 		if !ok {
@@ -222,11 +223,14 @@ func (c *GithubConnectorV3) MapClaims(claims GithubClaims) []string {
 			if team == mapping.Team {
 				// If there is a mapping for the current github
 				// username to ssh login, we add this login by default
-				logins = append(logins, mapping.Logins...)
+				if localLogin, ok := c.Spec.UsersMap[claims.Username]; ok {
+					logins = append(logins, localLogin)
+				}
+				kubeGroups = append(kubeGroups, mapping.KubeGroups...)
 			}
 		}
 	}
-	return utils.Deduplicate(logins)
+	return utils.Deduplicate(logins), utils.Deduplicate(kubeGroups)
 }
 
 var githubConnectorMarshaler GithubConnectorMarshaler = &TeleportGithubConnectorMarshaler{}
@@ -332,6 +336,12 @@ var TeamMappingSchema = `{
     "organization": {"type": "string"},
     "team": {"type": "string"},
     "logins": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "kubernetes_groups": {
       "type": "array",
       "items": {
         "type": "string"

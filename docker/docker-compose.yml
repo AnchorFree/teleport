@@ -6,7 +6,7 @@ services:
   one:
     image: teleport:latest
     container_name: one
-    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/one.yaml --gops --gops-addr=127.0.0.1:4321
+    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/one.yaml
     mem_limit: 300m
     memswap_limit: 0
     ports:
@@ -17,6 +17,7 @@ services:
     volumes:
       - ./data/one:/var/lib/teleport
       - ../:/root/go/src/github.com/gravitational/teleport
+      - certs:/mnt/shared/certs
     networks:
       teleport:
         ipv4_address: 172.10.1.1
@@ -29,7 +30,7 @@ services:
   one-node:
     image: teleport:latest
     container_name: one-node
-    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/one-node.yaml --gops --gops-addr=127.0.0.1:4321
+    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/one-node.yaml
     env_file: env.file
     mem_limit: 300m
     volumes:
@@ -40,12 +41,29 @@ services:
         ipv4_address: 172.10.1.20
 
   #
+  # one-node is a single-node Teleport cluster called "one" (runs all 3 roles: proxy, auth and node)
+  #
+  one-sshd:
+    image: teleport:latest
+    container_name: one-sshd
+    command: /usr/bin/start-sshd.sh
+    env_file: env.file
+    mem_limit: 300m
+    volumes:
+      - ./sshd/pam.d/ssh:/etc/pam.d/ssh
+      - ./sshd/etc/ssh/sshd_config:/etc/ssh/sshd_config
+      - certs:/mnt/shared/certs
+    networks:
+      teleport:
+        ipv4_address: 172.10.1.21
+
+  #
   # one-proxy is a second xproxy of the first cluster
   #
   one-proxy:
     image: teleport:latest
     container_name: one-proxy
-    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/one-proxy.yaml --gops --gops-addr=127.0.0.1:4321
+    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/one-proxy.yaml
     mem_limit: 300m
     ports:
       - "4080:3080"
@@ -67,7 +85,7 @@ services:
     mem_limit: 300m
     image: teleport:latest
     container_name: two-auth
-    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/two-auth.yaml --insecure --gops --gops-addr=127.0.0.1:4321
+    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/two-auth.yaml --insecure
     env_file: env.file
     volumes:
       - ./data/two/auth:/var/lib/teleport
@@ -83,7 +101,7 @@ services:
     mem_limit: 300m
     image: teleport:latest
     container_name: two-proxy
-    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/two-proxy.yaml --gops --gops-addr=127.0.0.1:4321
+    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/two-proxy.yaml
     env_file: env.file
     ports:
       - "5080:5080"
@@ -102,7 +120,7 @@ services:
     mem_limit: 300m
     image: teleport:latest
     container_name: two-node
-    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/two-node.yaml --gops --gops-addr=127.0.0.1:4321
+    command: ${CONTAINERHOME}/build/teleport start -d -c ${CONTAINERHOME}/docker/two-node.yaml
     env_file: env.file
     volumes:
       - ./data/two/node:/var/lib/teleport
@@ -120,3 +138,7 @@ networks:
       - subnet: 172.10.1.0/16
         ip_range: 172.10.1.0/24
         gateway: 172.10.1.254
+
+
+volumes:
+  certs:

@@ -20,6 +20,7 @@ package web
 
 import (
 	"compress/gzip"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -54,8 +55,8 @@ import (
 	"github.com/mailgun/lemma/secret"
 	"github.com/mailgun/ttlmap"
 	log "github.com/sirupsen/logrus"
-
 	"github.com/tstranex/u2f"
+	"golang.org/x/crypto/ssh"
 )
 
 // Handler is HTTP web proxy handler
@@ -101,6 +102,12 @@ type Config struct {
 	ProxySSHAddr utils.NetAddr
 	// ProxyWebAddr points to the web (HTTPS) address of the proxy
 	ProxyWebAddr utils.NetAddr
+
+	// ClientTLSConfig is the TLS configuration the client uses.
+	ClientTLSConfig *tls.Config
+
+	// ProxySettings is a settings communicated to proxy
+	ProxySettings client.ProxySettings
 }
 
 type RewritingHandler struct {
@@ -119,7 +126,7 @@ func (r *RewritingHandler) Close() error {
 // NewHandler returns a new instance of web proxy handler
 func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 	const apiPrefix = "/" + teleport.WebAPIVersion
-	lauth, err := newSessionCache(cfg.ProxyClient, []utils.NetAddr{cfg.AuthServers})
+	lauth, err := newSessionCache(cfg.ProxyClient, []utils.NetAddr{cfg.AuthServers}, cfg.ClientTLSConfig)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -133,10 +140,6 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 		if err := o(h); err != nil {
 			return nil, trace.Wrap(err)
 		}
-	}
-
-	if h.sessionStreamPollPeriod == 0 {
-		h.sessionStreamPollPeriod = sessionStreamPollPeriod
 	}
 
 	if h.clock == nil {
@@ -175,17 +178,19 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*RewritingHandler, error) {
 	h.GET("/webapi/sites/:site/namespaces/:namespace/nodes", h.WithClusterAuth(h.siteNodesGet))
 
 	// active sessions handlers
-	h.GET("/webapi/sites/:site/namespaces/:namespace/connect", h.WithClusterAuth(h.siteNodeConnect))                       // connect to an active session (via websocket)
-	h.GET("/webapi/sites/:site/namespaces/:namespace/sessions", h.WithClusterAuth(h.siteSessionsGet))                      // get active list of sessions
-	h.POST("/webapi/sites/:site/namespaces/:namespace/sessions", h.WithClusterAuth(h.siteSessionGenerate))                 // create active session metadata
-	h.GET("/webapi/sites/:site/namespaces/:namespace/sessions/:sid", h.WithClusterAuth(h.siteSessionGet))                  // get active session metadata
-	h.PUT("/webapi/sites/:site/namespaces/:namespace/sessions/:sid", h.WithClusterAuth(h.siteSessionUpdate))               // update active session metadata (parameters)
-	h.GET("/webapi/sites/:site/namespaces/:namespace/sessions/:sid/events/stream", h.WithClusterAuth(h.siteSessionStream)) // get active session's byte stream (from events)
+	h.GET("/webapi/sites/:site/namespaces/:namespace/connect", h.WithClusterAuth(h.siteNodeConnect))       // connect to an active session (via websocket)
+	h.GET("/webapi/sites/:site/namespaces/:namespace/sessions", h.WithClusterAuth(h.siteSessionsGet))      // get active list of sessions
+	h.POST("/webapi/sites/:site/namespaces/:namespace/sessions", h.WithClusterAuth(h.siteSessionGenerate)) // create active session metadata
+	h.GET("/webapi/sites/:site/namespaces/:namespace/sessions/:sid", h.WithClusterAuth(h.siteSessionGet))  // get active session metadata
 
 	// recorded sessions handlers
 	h.GET("/webapi/sites/:site/events", h.WithClusterAuth(h.siteEventsGet))                                            // get recorded list of sessions (from events)
 	h.GET("/webapi/sites/:site/namespaces/:namespace/sessions/:sid/events", h.WithClusterAuth(h.siteSessionEventsGet)) // get recorded session's timing information (from events)
 	h.GET("/webapi/sites/:site/namespaces/:namespace/sessions/:sid/stream", h.siteSessionStreamGet)                    // get recorded session's bytes (from events)
+
+	// scp file transfer
+	h.GET("/webapi/sites/:site/namespaces/:namespace/nodes/:server/:login/scp", h.WithClusterAuth(h.transferFile))
+	h.POST("/webapi/sites/:site/namespaces/:namespace/nodes/:server/:login/scp", h.WithClusterAuth(h.transferFile))
 
 	// OIDC related callback handlers
 	h.GET("/webapi/oidc/login/web", httplib.MakeHandler(h.oidcLoginWeb))
@@ -498,6 +503,7 @@ func (h *Handler) ping(w http.ResponseWriter, r *http.Request, p httprouter.Para
 
 	return client.PingResponse{
 		Auth:          defaultSettings,
+		Proxy:         h.cfg.ProxySettings,
 		ServerVersion: teleport.Version,
 	}, nil
 }
@@ -511,43 +517,39 @@ func (h *Handler) pingWithConnector(w http.ResponseWriter, r *http.Request, p ht
 		return nil, trace.Wrap(err)
 	}
 
+	response := &client.PingResponse{
+		Proxy:         h.cfg.ProxySettings,
+		ServerVersion: teleport.Version,
+	}
+
 	if connectorName == teleport.Local {
 		as, err := localSettings(h.cfg.ProxyClient, cap)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-
-		return &client.PingResponse{
-			Auth:          as,
-			ServerVersion: teleport.Version,
-		}, nil
+		response.Auth = as
+		return response, nil
 	}
 
 	// first look for a oidc connector with that name
 	oidcConnector, err := authClient.GetOIDCConnector(connectorName, false)
 	if err == nil {
-		return &client.PingResponse{
-			Auth:          oidcSettings(oidcConnector, cap),
-			ServerVersion: teleport.Version,
-		}, nil
+		response.Auth = oidcSettings(oidcConnector, cap)
+		return response, nil
 	}
 
 	// if no oidc connector was found, look for a saml connector
 	samlConnector, err := authClient.GetSAMLConnector(connectorName, false)
 	if err == nil {
-		return &client.PingResponse{
-			Auth:          samlSettings(samlConnector, cap),
-			ServerVersion: teleport.Version,
-		}, nil
+		response.Auth = samlSettings(samlConnector, cap)
+		return response, nil
 	}
 
 	// look for github connector
 	githubConnector, err := authClient.GetGithubConnector(connectorName, false)
 	if err == nil {
-		return &client.PingResponse{
-			Auth:          githubSettings(githubConnector, cap),
-			ServerVersion: teleport.Version,
-		}, nil
+		response.Auth = githubSettings(githubConnector, cap)
+		return response, nil
 	}
 
 	return nil, trace.BadParameter("invalid connector name %v", connectorName)
@@ -610,14 +612,23 @@ func (h *Handler) getWebConfig(w http.ResponseWriter, r *http.Request, p httprou
 		secondFactor = cap.GetSecondFactor()
 	}
 
+	// disable joining sessions if proxy session recording is enabled
+	var canJoinSessions = true
+	clsCfg, err := h.cfg.ProxyClient.GetClusterConfig()
+	if err != nil {
+		log.Errorf("Cannot retrieve ClusterConfig: %v.", err)
+	} else {
+		canJoinSessions = clsCfg.GetSessionRecording() != services.RecordAtProxy
+	}
+
 	authSettings := ui.WebConfigAuthSettings{
 		Providers:    authProviders,
 		SecondFactor: secondFactor,
 	}
 
 	webCfg := ui.WebConfig{
-		Auth:          authSettings,
-		ServerVersion: teleport.Version,
+		Auth:            authSettings,
+		CanJoinSessions: canJoinSessions,
 	}
 
 	out, err := json.Marshal(webCfg)
@@ -803,10 +814,11 @@ func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request, p httprou
 	if err != nil {
 		log.Warningf("[OIDC] Error while processing callback: %v", err)
 
+		message := "Unable to process callback from OIDC provider. Ask your system administrator to check audit logs for details."
 		// redirect to an error page
 		pathToError := url.URL{
 			Path:     "/web/msg/error/login_failed",
-			RawQuery: url.Values{"details": []string{"Unable to process callback from OIDC provider."}}.Encode(),
+			RawQuery: url.Values{"details": []string{message}}.Encode(),
 		}
 		http.Redirect(w, r, pathToError.String(), http.StatusFound)
 		return nil, nil
@@ -1331,7 +1343,7 @@ func (h *Handler) siteNodesGet(w http.ResponseWriter, r *http.Request, p httprou
 	if !services.IsValidNamespace(namespace) {
 		return nil, trace.BadParameter("invalid namespace %q", namespace)
 	}
-	servers, err := clt.GetNodes(namespace)
+	servers, err := clt.GetNodes(namespace, services.SkipValidation())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1395,51 +1407,8 @@ func (h *Handler) siteNodeConnect(
 
 	// start the websocket session with a web-based terminal:
 	log.Infof("[WEB] getting terminal to '%#v'", req)
-	term.Run(w, r)
+	term.Serve(w, r)
 
-	return nil, nil
-}
-
-// sessionStreamEvent is sent over the session stream socket, it contains
-// last events that occurred (only new events are sent)
-type sessionStreamEvent struct {
-	Events  []events.EventFields `json:"events"`
-	Session *session.Session     `json:"session"`
-	Servers []services.ServerV1  `json:"servers"`
-}
-
-// siteSessionStream returns a stream of events related to the session
-//
-// GET /v1/webapi/sites/:site/namespaces/:namespace/sessions/:sid/events/stream?access_token=bearer_token
-//
-// Successful response is a websocket stream that allows read write to the server and returns
-// json events
-//
-func (h *Handler) siteSessionStream(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
-	sessionID, err := session.ParseID(p.ByName("sid"))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	namespace := p.ByName("namespace")
-	if !services.IsValidNamespace(namespace) {
-		return nil, trace.BadParameter("invalid namespace %q", namespace)
-	}
-
-	connect, err := newSessionStreamHandler(namespace,
-		*sessionID, ctx, site, h.sessionStreamPollPeriod)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	// this is to make sure we close web socket connections once
-	// sessionContext that owns them expires
-	ctx.AddClosers(connect)
-	defer func() {
-		connect.Close()
-		ctx.RemoveCloser(connect)
-	}()
-
-	connect.Handler().ServeHTTP(w, r)
 	return nil, nil
 }
 
@@ -1483,48 +1452,6 @@ func (h *Handler) siteSessionGenerate(w http.ResponseWriter, r *http.Request, p 
 
 type siteSessionUpdateReq struct {
 	TerminalParams session.TerminalParams `json:"terminal_params"`
-}
-
-// siteSessionUpdate udpdates the site session
-//
-// PUT /v1/webapi/sites/:site/sessions/:sid
-//
-// Request body:
-//
-// {"terminal_params": {"w": 100, "h": 100}}
-//
-// Response body:
-//
-// {"message": "ok"}
-//
-func (h *Handler) siteSessionUpdate(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
-	sessionID, err := session.ParseID(p.ByName("sid"))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	var req *siteSessionUpdateReq
-	if err := httplib.ReadJSON(r, &req); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	siteAPI, err := site.GetClient()
-	if err != nil {
-		log.Error(err)
-		return nil, trace.Wrap(err)
-	}
-
-	namespace := p.ByName("namespace")
-	if !services.IsValidNamespace(namespace) {
-		return nil, trace.BadParameter("invalid namespace %q", namespace)
-	}
-
-	err = ctx.UpdateSessionTerminal(siteAPI, namespace, *sessionID, req.TerminalParams)
-	if err != nil {
-		log.Error(err)
-		return nil, trace.Wrap(err)
-	}
-	return ok(), nil
 }
 
 type siteSessionsGetResponse struct {
@@ -1604,7 +1531,6 @@ const maxStreamBytes = 5 * 1024 * 1024
 //
 func (h *Handler) siteEventsGet(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
 	query := r.URL.Query()
-	log.Infof("web.getEvents(%v)", r.URL.RawQuery)
 
 	clt, err := ctx.GetUserClient(site)
 	if err != nil {
@@ -1632,7 +1558,7 @@ func (h *Handler) siteEventsGet(w http.ResponseWriter, r *http.Request, p httpro
 		}
 	}
 
-	el, err := clt.SearchSessionEvents(from, to)
+	el, err := clt.SearchSessionEvents(from, to, defaults.EventsIterationLimit)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1776,7 +1702,7 @@ func (h *Handler) siteSessionEventsGet(w http.ResponseWriter, r *http.Request, p
 	if !services.IsValidNamespace(namespace) {
 		return nil, trace.BadParameter("invalid namespace %q", namespace)
 	}
-	e, err := clt.GetSessionEvents(namespace, *sessionID, afterN)
+	e, err := clt.GetSessionEvents(namespace, *sessionID, afterN, true)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1981,6 +1907,7 @@ func (h *Handler) AuthenticateRequest(w http.ResponseWriter, r *http.Request, ch
 			logger.Warningf("no auth headers %v", err)
 			return nil, trace.AccessDenied("need auth")
 		}
+
 		if creds.Password != ctx.GetWebSession().GetBearerToken() {
 			logger.Warningf("bad bearer token")
 			return nil, trace.AccessDenied("bad bearer token")
@@ -2013,8 +1940,28 @@ func ok() interface{} {
 
 // CreateSignupLink generates and returns a URL which is given to a new
 // user to complete registration with Teleport via Web UI
-func CreateSignupLink(hostPort string, token string) string {
-	return "https://" + hostPort + "/web/newuser/" + token
+func CreateSignupLink(client auth.ClientI, token string) (string, string) {
+	proxyHost := "<proxyhost>:3080"
+
+	proxies, err := client.GetProxies()
+	if err != nil {
+		log.Errorf("Unable to retrieve proxy list: %v", err)
+	}
+
+	if len(proxies) > 0 {
+		proxyHost = proxies[0].GetPublicAddr()
+		if proxyHost == "" {
+			proxyHost = fmt.Sprintf("%v:%v", proxies[0].GetHostname(), defaults.HTTPListenPort)
+			log.Debugf("public_address not set for proxy, returning proxyHost: %q", proxyHost)
+		}
+	}
+
+	u := &url.URL{
+		Scheme: "https",
+		Host:   proxyHost,
+		Path:   "web/newuser/" + token,
+	}
+	return u.String(), proxyHost
 }
 
 type responseData struct {
@@ -2023,4 +1970,35 @@ type responseData struct {
 
 func makeResponse(items interface{}) (interface{}, error) {
 	return responseData{Items: items}, nil
+}
+
+// makeTeleportClientConfig creates default teleport client configuration
+// that is used to initiate an SSH terminal session or SCP file transfer
+func makeTeleportClientConfig(ctx *SessionContext) (*client.Config, error) {
+	agent, cert, err := ctx.GetAgent()
+	if err != nil {
+		return nil, trace.BadParameter("failed to get user credentials: %v", err)
+	}
+
+	signers, err := agent.Signers()
+	if err != nil {
+		return nil, trace.BadParameter("failed to get user credentials: %v", err)
+	}
+
+	tlsConfig, err := ctx.ClientTLSConfig()
+	if err != nil {
+		return nil, trace.BadParameter("failed to get client TLS config: %v", err)
+	}
+
+	config := &client.Config{
+		Username:         ctx.user,
+		Agent:            agent,
+		SkipLocalAuth:    true,
+		TLS:              tlsConfig,
+		AuthMethods:      []ssh.AuthMethod{ssh.PublicKeys(signers...)},
+		DefaultPrincipal: cert.ValidPrincipals[0],
+		HostKeyCallback:  func(string, net.Addr, ssh.PublicKey) error { return nil },
+	}
+
+	return config, nil
 }

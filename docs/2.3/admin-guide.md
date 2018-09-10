@@ -111,7 +111,7 @@ Flags:
       --advertise-ip     IP to advertise to clients if running behind NAT
   -l, --listen-ip        IP address to bind to [0.0.0.0]
       --auth-server      Address of the auth server [127.0.0.1:3025]
-      --token            One-time token to register with an auth server [none]
+      --token            Invitation token to join a cluster [none]
       --nodename         Name of this node, defaults to hostname
   -c, --config           Path to a configuration file [/etc/teleport.yaml]
       --labels           List of labels for this node
@@ -178,7 +178,7 @@ teleport:
     # authentication (if using the default BoltDB back-end)
     data_dir: /var/lib/teleport
 
-    # one-time invitation token used to join a cluster. it is not used on
+    # Invitation token used to join a cluster. it is not used on
     # subsequent starts
     auth_token: xxxx-token-xxxx
 
@@ -734,11 +734,6 @@ scp             | Remote file copy has been executed. The following fields will 
 resize          | Terminal has been resized.
 user.login      | A user logged into web UI or via tsh. The following fields will be logged: `{"user": "alice@example.com", "method": "local"}`.
 
-!!! tip "Note":
-    The commercial Teleport edition called "Teleport Enterprise" supports native
-    audit log exporting into external systems like Splunk, AlertLogic and others.
-    Take a look at [Teleport Enterprise](enterprise.md) section to learn more.
-
 ### Recorded Sessions
 
 In addition to logging `session.start` and `session.end` events, Teleport also records the entire
@@ -942,6 +937,12 @@ list of available clusters.
     teleport daemon of "east" can be started with `--insecure` CLI flag to
     accept self-signed certificates. Make sure to configure HTTPS properly and
     remove the insecure flag for production use.
+
+!!! warning "Version Warning":
+    Trusted cluster configuration in Teleport 2.3 is not backwards compatible
+    with 2.2! If you are migrating from 2.2 it's recommended to delete a trusted
+    cluster resource, then upgrade both clusters to 2.3 and re-establish trust
+    by following the instructions above.
 
 ### Using Trusted Clusters
 

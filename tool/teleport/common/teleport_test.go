@@ -18,7 +18,6 @@ package common
 
 import (
 	"io/ioutil"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -77,7 +76,7 @@ func (s *MainTestSuite) TestDefault(c *check.C) {
 	c.Assert(conf.SSH.Enabled, check.Equals, true)
 	c.Assert(conf.Proxy.Enabled, check.Equals, true)
 	c.Assert(conf.Console, check.Equals, os.Stdout)
-	c.Assert(log.GetLevel(), check.Equals, log.WarnLevel)
+	c.Assert(log.GetLevel(), check.Equals, log.ErrorLevel)
 }
 
 func (s *MainTestSuite) TestRolesFlag(c *check.C) {
@@ -119,7 +118,7 @@ func (s *MainTestSuite) TestConfigFile(c *check.C) {
 	c.Assert(log.GetLevel(), check.Equals, log.DebugLevel)
 	c.Assert(conf.Hostname, check.Equals, "hvostongo.example.org")
 	c.Assert(conf.Token, check.Equals, "xxxyyy")
-	c.Assert(conf.AdvertiseIP, check.DeepEquals, net.ParseIP("10.5.5.5"))
+	c.Assert(conf.AdvertiseIP, check.DeepEquals, "10.5.5.5")
 	c.Assert(conf.SSH.Labels, check.DeepEquals, map[string]string{"a": "a1", "b": "b1"})
 }
 

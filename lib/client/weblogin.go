@@ -12,12 +12,12 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
 */
 
 package client
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
@@ -31,13 +31,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/auth"
 
 	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
+
 	"github.com/mailgun/lemma/secret"
 	log "github.com/sirupsen/logrus"
-
 	"github.com/tstranex/u2f"
 )
 
@@ -128,7 +129,7 @@ type sealData struct {
 }
 
 // SSHAgentSSOLogin is used by SSH Agent (tsh) to login using OpenID connect
-func SSHAgentSSOLogin(proxyAddr, connectorID string, pubKey []byte, ttl time.Duration, insecure bool, pool *x509.CertPool, protocol string, compatibility string) (*auth.SSHLoginResponse, error) {
+func SSHAgentSSOLogin(ctx context.Context, proxyAddr, connectorID string, pubKey []byte, ttl time.Duration, insecure bool, pool *x509.CertPool, protocol string, compatibility string) (*auth.SSHLoginResponse, error) {
 	clt, proxyURL, err := initClient(proxyAddr, insecure, pool)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -224,29 +225,51 @@ func SSHAgentSSOLogin(proxyAddr, connectorID string, pubKey []byte, ttl time.Dur
 		return nil, trace.Wrap(err)
 	}
 
-	fmt.Printf("If browser window does not open automatically, open it by clicking on the link:\n %v\n", re.RedirectURL)
-
-	var command = "sensible-browser"
-	if runtime.GOOS == "darwin" {
-		command = "open"
+	// If a command was found to launch the browser, create and start it.
+	var execCmd *exec.Cmd
+	switch runtime.GOOS {
+	// macOS.
+	case teleport.DarwinOS:
+		path, err := exec.LookPath(teleport.OpenBrowserDarwin)
+		if err == nil {
+			execCmd = exec.Command(path, re.RedirectURL)
+		}
+	// Windows.
+	case teleport.WindowsOS:
+		path, err := exec.LookPath(teleport.OpenBrowserWindows)
+		if err == nil {
+			execCmd = exec.Command(path, "url.dll,FileProtocolHandler", re.RedirectURL)
+		}
+	// Linux or any other operating sytem.
+	default:
+		path, err := exec.LookPath(teleport.OpenBrowserLinux)
+		if err == nil {
+			execCmd = exec.Command(path, re.RedirectURL)
+		}
 	}
-	path, err := exec.LookPath(command)
-	if err == nil {
-		exec.Command(path, re.RedirectURL).Start()
+	if execCmd != nil {
+		execCmd.Start()
 	}
 
-	log.Infof("waiting for response on %v", server.URL)
+	// Print to screen in-case the command that launches the browser did not run.
+	fmt.Printf("If browser window does not open automatically, open it by ")
+	fmt.Printf("clicking on the link:\n %v\n", re.RedirectURL)
+
+	log.Infof("Waiting for response at: %v.", server.URL)
 
 	select {
 	case err := <-errorC:
-		log.Debugf("got error: %v", err)
+		log.Debugf("Got an error: %v.", err)
 		return nil, trace.Wrap(err)
 	case response := <-waitC:
-		log.Debugf("got response")
+		log.Debugf("Got response from browser.")
 		return response, nil
 	case <-time.After(60 * time.Second):
-		log.Debugf("got timeout waiting for callback")
-		return nil, trace.Wrap(trace.Errorf("timeout waiting for callback"))
+		log.Debugf("Timed out waiting for callback.")
+		return nil, trace.Wrap(trace.Errorf("timed out waiting for callback"))
+	case <-ctx.Done():
+		log.Debugf("Canceled by user.")
+		return nil, trace.Wrap(ctx.Err())
 	}
 }
 
@@ -255,8 +278,32 @@ func SSHAgentSSOLogin(proxyAddr, connectorID string, pubKey []byte, ttl time.Dur
 type PingResponse struct {
 	// Auth contains the forms of authentication the auth server supports.
 	Auth AuthenticationSettings `json:"auth"`
+	// Proxy contains the proxy settings.
+	Proxy ProxySettings `json:"proxy"`
 	// ServerVersion is the version of Teleport that is running.
 	ServerVersion string `json:"server_version"`
+}
+
+// ProxySettings contains basic information about proxy settings
+type ProxySettings struct {
+	// Kube is a kubernetes specific proxy section
+	Kube KubeProxySettings `json:"kube"`
+	// SSH is SSH specific proxy settings
+	SSH SSHProxySettings `json:"ssh"`
+}
+
+// KubeProxySettings is kubernetes proxy settings
+type KubeProxySettings struct {
+	// Enabled is true when kubernetes proxy is enabled
+	Enabled bool `json:"enabled,omitempty"`
+	// PublicAddr is a kubernetes proxy public address if set
+	PublicAddr string `json:"public_addr,omitempty"`
+}
+
+// SSHProxySettings is SSH specific proxy settings
+type SSHProxySettings struct {
+	// ListenAddr is SSH listen address
+	ListenAddr string `json:"listen_addr,omitempty"`
 }
 
 // PingResponse contains the form of authentication the auth server supports.

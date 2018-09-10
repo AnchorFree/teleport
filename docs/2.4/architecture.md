@@ -65,7 +65,7 @@ Teleport supports two types of user accounts:
       [Authy](https://www.authy.com/) or any other TOTP client.
     * [U2F](https://en.wikipedia.org/wiki/Universal_2nd_Factor).
 * **External users** are users stored elsewhere else within an organization. Examples include
-  Github, Active Directory (AD), LDAP server, OpenID/OAuth2 endpoint or behind SAML. 
+  Github, Active Directory (AD), OpenID/OAuth2 endpoint or behind SAML. 
 
 
 !!! tip "Version Warning": 
@@ -196,7 +196,7 @@ configurable key storage. The auth server also keeps the records of what has bee
 inside the cluster: it stores recordings of all SSH sessions in the configurable events 
 storage.
 
-![Teleport Auth](img/auth-server.svg)
+![Teleport Auth](img/auth-server.svg?style=grv-image-center-lg)
 
 When a new node joins the cluster, the auth server generates a new public / private keypair for 
 the node and signs its certificate.
@@ -279,7 +279,7 @@ Teleport Proxy implements a special method to let clients get short lived certif
 1. TSH client or TSH agent generate OpenSSH keypair and forward generated public key and username, password and second factor token that are entered by user to the proxy.
 2. Proxy forwards request to the auth server.
 3. If auth server accepts credentials, it generates a new certificate signed by its user CA and sends it back to the proxy.
-4. Proxy 
+4. Proxy returns the user certificate to the client and client stores it in `~/.tsh/keys`
 
 #### Connecting to the nodes
 
@@ -357,7 +357,7 @@ on the Teleport proxy server. This is not the case because a proxy cannot see
 the encrypted traffic, it is encrypted end-to-end, i.e. from an SSH client to
 an SSH server/node, see the diagram below:
 
-![session-recording-diagram](img/session-recording.svg)
+![session-recording-diagram](img/session-recording.svg?style=grv-image-center-lg)
 
 However, starting from Teleport 2.4 it is now possible to configure the
 Teleport proxy to enable the "recording proxy mode". In this mode the proxy
@@ -367,7 +367,7 @@ to the final destination server, effectively becoming an authorized "man in the
 middle". This allows the proxy server to forward SSH session data to the auth
 server to be recorded, as shown below:
 
-![recorindg-proxy](img/recording-proxy.svg)
+![recorindg-proxy](img/recording-proxy.svg?style=grv-image-center-lg)
 
 The recording proxy mode, although _less secure_, was added to allow Teleport
 users to enable session recording for OpenSSH's servers running `sshd` which is

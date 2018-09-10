@@ -89,6 +89,7 @@ type ServicesTestSuite struct {
 	PresenceS     services.Presence
 	ProvisioningS services.Provisioner
 	WebS          services.Identity
+	ConfigS       services.ClusterConfiguration
 	ChangesC      chan interface{}
 }
 
@@ -174,11 +175,11 @@ func (s *ServicesTestSuite) UsersCRUD(c *C) {
 	userSlicesEqual(c, u, []services.User{newUser("user2", nil)})
 
 	err = s.WebS.DeleteUser("user1")
-	c.Assert(trace.IsNotFound(err), Equals, true, Commentf("unexpected %T %#v", err, err))
+	fixtures.ExpectNotFound(c, err)
 
 	// bad username
 	err = s.WebS.UpsertUser(newUser("", nil))
-	c.Assert(trace.IsBadParameter(err), Equals, true, Commentf("expected bad parameter error, got %T", err))
+	fixtures.ExpectBadParameter(c, err)
 }
 
 func (s *ServicesTestSuite) LoginAttempts(c *C) {
@@ -226,6 +227,26 @@ func (s *ServicesTestSuite) CertAuthCRUD(c *C) {
 
 	err = s.CAS.DeleteCertAuthority(*ca.ID())
 	c.Assert(err, IsNil)
+
+	// test compare and swap
+	ca = NewTestCA(services.UserCA, "example.com")
+	c.Assert(s.CAS.CreateCertAuthority(ca), IsNil)
+
+	clock := clockwork.NewFakeClock()
+	newCA := *ca
+	rotation := services.Rotation{
+		State:       services.RotationStateInProgress,
+		CurrentID:   "id1",
+		GracePeriod: services.NewDuration(time.Hour),
+		Started:     clock.Now(),
+	}
+	newCA.SetRotation(rotation)
+
+	err = s.CAS.CompareAndSwapCertAuthority(&newCA, ca)
+
+	out, err = s.CAS.GetCertAuthority(ca.GetID(), true)
+	c.Assert(err, IsNil)
+	fixtures.DeepCompare(c, &newCA, out)
 }
 
 func newServer(kind, name, addr, namespace string) *services.ServerV2 {
@@ -313,13 +334,13 @@ func (s *ServicesTestSuite) ReverseTunnelsCRUD(c *C) {
 	c.Assert(len(out), Equals, 0)
 
 	err = s.PresenceS.UpsertReverseTunnel(newReverseTunnel("", []string{"127.0.0.1:1234"}))
-	c.Assert(trace.IsBadParameter(err), Equals, true, Commentf("%#v", err))
+	fixtures.ExpectBadParameter(c, err)
 
-	err = s.PresenceS.UpsertReverseTunnel(newReverseTunnel("example.com", []string{"bad address"}))
-	c.Assert(trace.IsBadParameter(err), Equals, true, Commentf("%#v", err))
+	err = s.PresenceS.UpsertReverseTunnel(newReverseTunnel("example.com", []string{""}))
+	fixtures.ExpectBadParameter(c, err)
 
 	err = s.PresenceS.UpsertReverseTunnel(newReverseTunnel("example.com", []string{}))
-	c.Assert(trace.IsBadParameter(err), Equals, true, Commentf("%#v", err))
+	fixtures.ExpectBadParameter(c, err)
 }
 
 func (s *ServicesTestSuite) PasswordHashCRUD(c *C) {
@@ -409,7 +430,9 @@ func (s *ServicesTestSuite) RolesCRUD(c *C) {
 		},
 		Spec: services.RoleSpecV3{
 			Options: services.RoleOptions{
-				services.MaxSessionTTL: services.Duration{Duration: time.Hour},
+				MaxSessionTTL:     services.Duration{Duration: time.Hour},
+				PortForwarding:    services.NewBoolOption(true),
+				CertificateFormat: teleport.CertificateFormatStandard,
 			},
 			Allow: services.RoleConditions{
 				Logins:     []string{"root", "bob"},
@@ -428,7 +451,7 @@ func (s *ServicesTestSuite) RolesCRUD(c *C) {
 	c.Assert(err, IsNil)
 	rout, err := s.Access.GetRole(role.Metadata.Name)
 	c.Assert(err, IsNil)
-	c.Assert(rout, DeepEquals, &role)
+	fixtures.DeepCompare(c, rout, &role)
 
 	role.Spec.Allow.Logins = []string{"bob"}
 	err = s.Access.UpsertRole(&role, backend.Forever)
@@ -658,6 +681,7 @@ func (s *ServicesTestSuite) GithubConnectorCRUD(c *C) {
 					Organization: "gravitational",
 					Team:         "admins",
 					Logins:       []string{"admin"},
+					KubeGroups:   []string{"system:masters"},
 				},
 			},
 		},
@@ -737,4 +761,22 @@ func (s *ServicesTestSuite) RemoteClustersCRUD(c *C) {
 
 	err = s.PresenceS.DeleteRemoteCluster(clusterName)
 	fixtures.ExpectNotFound(c, err)
+}
+
+// AuthPreference tests authentication preference service
+func (s *ServicesTestSuite) AuthPreference(c *C) {
+	ap, err := services.NewAuthPreference(services.AuthPreferenceSpecV2{
+		Type:         "local",
+		SecondFactor: "otp",
+	})
+	c.Assert(err, IsNil)
+
+	err = s.ConfigS.SetAuthPreference(ap)
+	c.Assert(err, IsNil)
+
+	gotAP, err := s.ConfigS.GetAuthPreference()
+	c.Assert(err, IsNil)
+
+	c.Assert(gotAP.GetType(), Equals, "local")
+	c.Assert(gotAP.GetSecondFactor(), Equals, "otp")
 }
